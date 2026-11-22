@@ -1,0 +1,301 @@
+# One project, total separation of Telegram from the processing IP.
+#
+#   * telegram  -- ONE clean container that owns every media-bot's Telegram
+#     identity. It holds NO processing code: each dock just receives a file
+#     (or link) and POSTs it to a service over HTTP, then sends the bytes
+#     back (minions/telegram/main.py -> minions.telegram.relay -> CallService).
+#   * svc-*      -- the processing IP, one atomic web service per Step, bytes
+#     in / bytes out (the same one image). No Telegram here. Callable by
+#     the telegram container, by React Flow, by any HTTP/MCP client.
+#   * reactflow -- another web consumer of the same svc-*.
+#
+# The remaining bots are not file-processors coupled to Telegram, so they
+# stay as they are: inbox (ingest, no IP), moderator/props (chat commands),
+# sort/batch (folder watch + cron).
+#
+# DRIVE_NAS points at the media tree on the host; .env holds secrets. print
+# and catch are NOT here: they live on the Windows machine.
+#
+# Images are built on GitHub and published to GHCR (image.yml); the NAS only
+# PULLS. There is deliberately NO `build:` here: a `build:` makes Synology
+# Container Manager (and `docker compose up` when the image is absent) BUILD
+# the image locally -- slow (it apt-installs ffmpeg, pip-installs torch...)
+# and it ships whatever is on disk, not the published :latest. For local dev,
+# build the base image by hand instead:
+#   docker build -t ghcr.io/coppermilk/minion2:latest -f docker/Dockerfile .
+x-minion: &minion
+  image: ghcr.io/coppermilk/minion2:latest
+  pull_policy: missing
+  env_file: .env
+  environment: &minion-env
+    DRIVE: /data
+    TORCH_HOME: /data/bots/_data/regen/torch
+    HF_HOME: /data/bots/_data/regen/hf
+  volumes:
+    - ${DRIVE_NAS}:/data
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  # NO `logging:` override on purpose. Synology Container Manager's Log tab
+  # reads ONLY its built-in `db` logging driver; ANY override here (e.g.
+  # json-file) leaves that tab blank even though `docker logs` over SSH still
+  # works -- that is why container logs never showed in the GUI. Omitting it
+  # lets each container use the daemon's default driver (db on the NAS), so
+  # the Log tab works, same as Immich. Log retention is the db driver's job on
+  # the NAS (managed by DSM); a plain dev Docker falls back to its json-file
+  # default. The bots ALSO mirror every line to a <name>.log file
+  # (kernel.bot_logger), so a file copy survives regardless of the driver.
+
+# Atomic service: one Step, one container, bytes in / bytes out. Stateless
+# (a fresh temp store per request), so no /data mount. The command picks the
+# Step (python -m minions.svc.<name>.service), SKIN the facade (http | mcp).
+# Rides the same one image as the bots -- the web layer is baked in.
+x-service: &svc
+  image: ghcr.io/coppermilk/minion2:latest
+  pull_policy: missing
+  environment: &svc-env
+    SKIN: http
+    # Bind all interfaces inside the container so the host can map the port;
+    # serve.py defaults to 127.0.0.1 when this is unset (local dev).
+    SERVICE_HOST: 0.0.0.0
+  # No volumes: a service is stateless (bytes in / bytes out) and logs only
+  # to stdout, which Synology Container Manager's Log tab reads.
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  # NO `logging:` override -- see the note on the bot anchor above (an
+  # override blanks Synology Container Manager's Log tab).
+
+services:
+  # --- Atomic services (svc-*): the processing IP, pure web, no Telegram
+  svc-censor-blur:
+    <<: *svc
+    environment:
+      <<: *svc-env
+    command: python -m minions.svc.censor_blur.service
+    ports:
+      - "${SVC_CENSOR_BLUR_PORT:-8091}:8000"
+    mem_limit: 4g
+
+  svc-censor-black:
+    <<: *svc
+    environment:
+      <<: *svc-env
+    command: python -m minions.svc.censor_black.service
+    ports:
+      - "${SVC_CENSOR_BLACK_PORT:-8092}:8000"
+    mem_limit: 4g
+
+  # Full restore (blur people + LLM repaint); needs Gemini, so it reads .env.
+  svc-restore:
+    <<: *svc
+    env_file: .env
+    environment:
+      <<: *svc-env
+    command: python -m minions.svc.restore.service
+    ports:
+      - "${SVC_RESTORE_PORT:-8093}:8000"
+    mem_limit: 4g
+
+  # Full frames (fetch a link or pass a file, then extract). A folder of
+  # frames comes back as one zip (see services/http.py).
+  svc-frames:
+    <<: *svc
+    environment:
+      <<: *svc-env
+    command: python -m minions.svc.frames.service
+    ports:
+      - "${SVC_FRAMES_PORT:-8094}:8000"
+    mem_limit: 2g
+
+  # Link -> video (yt-dlp). Serves both the fetch and fan-save docks.
+  svc-fetch:
+    <<: *svc
+    environment:
+      <<: *svc-env
+    command: python -m minions.svc.fetch.service
+    ports:
+      - "${SVC_FETCH_PORT:-8095}:8000"
+    mem_limit: 1g
+
+  # --- The one Telegram container: all media docks, zero processing IP.
+  # Each bot in TELEGRAM_BOTS runs its own relay belt (own token) and calls
+  # its SERVICE_URL_* over HTTP. Tokens come from .env.
+  telegram:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TELEGRAM_BOTS: censor-blur,censor-black,restore,frames,fetch,fan-save
+      SERVICE_URL_CENSOR_BLUR: http://svc-censor-blur:8000
+      SERVICE_URL_CENSOR_BLACK: http://svc-censor-black:8000
+      SERVICE_URL_RESTORE: http://svc-restore:8000
+      SERVICE_URL_FRAMES: http://svc-frames:8000
+      SERVICE_URL_FETCH: http://svc-fetch:8000
+      SERVICE_URL_FAN_SAVE: http://svc-fetch:8000
+      RELAY_DOCK_FRAMES: any
+      RELAY_DOCK_FETCH: links
+      RELAY_DOCK_FAN_SAVE: links
+    command: python -m minions.telegram.main
+    mem_limit: 1g
+    depends_on:
+      - svc-censor-blur
+      - svc-censor-black
+      - svc-restore
+      - svc-frames
+      - svc-fetch
+
+  # --- Monolith bots (not file-processors coupled to Telegram)
+  inbox:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TG_TOKEN: ${TG_TOKEN_INBOX:-}
+    command: python -m minions.bots.inbox.main
+    mem_limit: 512m
+
+  sort:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      SORT_WATCH: '1'
+    command: python -m minions.bots.sort.main
+    mem_limit: 4g
+
+  moderator:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TG_TOKEN: ${TG_TOKEN_MODERATOR:-}
+    command: python -m minions.bots.moderator.main
+    mem_limit: 256m
+
+  props:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TG_TOKEN: ${TG_TOKEN_PROPS:-}
+    command: python -m minions.bots.props.main
+    mem_limit: 4g
+
+  # donations: poll a donation platform (Streamlabs today; the feed is
+  # platform-agnostic, so Revolut and others slot in later) and post each
+  # new donor alert -- who gave, how much, and their question -- to
+  # DONATION_CHAT, in Russian. No model of its own, so no ollama
+  # dependency; unconfigured (no token/chat) it idles harmlessly.
+  donations:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TG_TOKEN: ${TG_TOKEN_DONATIONS:-}
+    command: python -m minions.bots.donations.main
+    mem_limit: 256m
+
+  # week-clean and wishlist ride cron; the foreground cron is the
+  # supervisor. WISHLIST is grepped in too so the wishlist bot's URL and
+  # target chat reach the cron environment alongside DRIVE and the tokens.
+  batch:
+    <<: *minion
+    command: sh -c 'env | grep -E "DRIVE|TORCH|HF|TG_|GEMINI|WISHLIST" > /etc/minions.env; exec cron -f'
+    mem_limit: 512m
+
+  # --- Web consumers of the services (separate containers, one project)
+  # React Flow canvas placeholder: a static page that will call the svc-*
+  # over the web. Swap the mounted dir for the built app when it exists.
+  reactflow:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${REACTFLOW_PORT:-8088}:80"
+    volumes:
+      - ./deploy/reactflow:/usr/share/nginx/html:ro
+
+  # aggregator: a Telethon USER account (not a bot-token minion) -- the only
+  # kind that may send premium emoji. It listens to a source chat, groups a
+  # Short's per-platform links, and posts the collected message to one or more
+  # target chats. It rides the ONE shared image (telethon is baked in via the
+  # pyproject `tg` extra), so there is no separate image to build.
+  #
+  # Config lives in .env: SOURCE_CHAT_ID, TARGET_CHAT_ID (comma-separated for
+  # several chats), plus TELEGRAM_API_ID / TELEGRAM_API_HASH (my.telegram.org).
+  # The session is a FILE on the shared /data mount, so a one-time login
+  # survives restarts. First login (once): docker compose run --rm userbot.
+  #
+  # NB: no `cpus:` cap here -- this Synology kernel has no CPU CFS quota, so
+  # `cpus` fails container creation ("NanoCPUs can not be set"). If it climbs
+  # to high CPU on a long run, restart just this container (Container Manager,
+  # or docker restart minion2-userbot-1).
+  #
+  # SELF-HEALING. `restart: always` (overriding the anchor's unless-stopped)
+  # brings it back after any exit, reboot, or daemon restart. A HANG (process
+  # alive but wedged) is not an exit, so no restart policy alone would catch
+  # it -- the app runs an in-process watchdog that os._exit(1)s when its
+  # heartbeat goes stale, turning a hang into an exit the policy DOES restart.
+  # The heartbeat is a file the app stamps only after a successful Telegram
+  # probe; the healthcheck below reads it so Container Manager shows
+  # healthy/unhealthy (compose does not auto-restart on unhealthy -- the
+  # watchdog does). This replaces the old "weekly Task-Scheduler restart".
+  userbot:
+    <<: *minion
+    environment:
+      <<: *minion-env
+      TELEGRAM_SESSION_FILE: /data/bots/aggregator/telethon
+      AGGREGATOR_STATE_DIR: /data/bots/aggregator
+      # Live state (userbot.db, telethon.session, heartbeat/log) writes to a
+      # named volume OFF the Cloud-Synced /data, so Google Drive is no longer
+      # re-uploaded on every commit; only the 4h snapshot touches /data
+      # (AGGREGATOR_STATE_DIR is the backup target + cold-start restore
+      # source). config.local_state_dir() reads this. It lives HERE, not in
+      # .env: .env is copied verbatim to the Windows box, where this value
+      # would misdirect `python -m minions.userbot.login` and, as a Linux
+      # path, break REQ-CFG-001 there.
+      LOCAL_STATE_DIR: /state-local
+    # `<<: *minion` sets volumes to [${DRIVE_NAS}:/data]; a service-level
+    # volumes: replaces that whole list, so the /data mount is re-listed here.
+    volumes:
+      - ${DRIVE_NAS}:/data
+      - aggregator-state:/state-local
+    command: python -m minions.userbot.main
+    restart: always
+    healthcheck:
+      # Unhealthy when the heartbeat file is older than 10 min (the app stamps
+      # it only when the Telegram probe succeeds). Visibility only.
+      test: ["CMD", "python", "-c", "import os,time,sys; sys.exit(0 if time.time()-os.path.getmtime('/state-local/health')<600 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # No tty/stdin here: a TTY makes Synology Container Manager's Log tab show
+    # "No logs available". The one-time login uses `docker compose run --rm
+    # aggregator`, which allocates its own TTY, so interactive login still works.
+    mem_limit: 256m
+
+  # donate: TEMPORARILY DISABLED -- it keeps crash-looping and is not needed
+  # right now, so it is commented out (not deleted) for easy restore. To bring
+  # it back, uncomment the block below and redeploy.
+  #
+  # A SECOND Telethon USER account (a Telethon session is one account, so it
+  # cannot share the aggregator's). It listens for the /donate command and
+  # renders a formatted donation shout-out with premium emoji. Same shared
+  # image; its own session file on /data survives restarts. Config lives in
+  # .env: DONATE_API_ID / DONATE_API_HASH (my.telegram.org), optional
+  # DONATE_CHAT_ID (where to render; unset = reply in the command's chat). First
+  # login (once): docker compose run --rm donate python -m minions.donate.login,
+  # then `docker compose up -d donate` runs it silently.
+  # donate:
+  #   <<: *minion
+  #   environment:
+  #     <<: *minion-env
+  #     DONATE_SESSION_FILE: /data/bots/donate/telethon
+  #   command: python -m minions.donate.main
+  #   # No tty/stdin here (see aggregator): a TTY blanks Synology's Log tab. The
+  #   # one-time login uses `docker compose run --rm donate ...`, its own TTY.
+  #   mem_limit: 256m
+
+volumes:
+  # userbot live state, OFF the Cloud-Synced /data mount (see LOCAL_STATE_DIR
+  # in the userbot service). A named volume lives under Synology's
+  # /volume1/@docker/volumes, which Cloud Sync does not touch, and survives
+  # `compose down/up` (nas-update.sh runs `down` without -v).
+  aggregator-state:

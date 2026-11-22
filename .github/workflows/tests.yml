@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # Python 3.8 — как системный python3 в Synology DSM 7.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Закреплённый docker compose (тот же, что качает nas-update)
+        run: |
+          curl -fsSL -o /tmp/docker-compose \
+            https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64
+          echo "383ce6698cd5d5bbf958d2c8489ed75094e34a77d340404d9f32c4ae9e12baf0  /tmp/docker-compose" | sha256sum -c
+          chmod +x /tmp/docker-compose
+      - name: pyflakes
+        run: pip install pyflakes && python -m pyflakes *.py tests/*.py
+      - name: Тесты (от root: chroot, смена владельца, fork от nobody)
+        env:
+          COMPOSE_BIN: /tmp/docker-compose
+        run: |
+          for t in test_policy sim_git sim_releases; do
+            echo "::group::$t"
+            sudo -E env "PATH=$PATH" python "tests/$t.py"
+            echo "::endgroup::"
+          done
