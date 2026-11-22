@@ -24,7 +24,7 @@ jobs:
           chmod +x /tmp/docker-compose
       - name: pyflakes
         run: pip install pyflakes && python -m pyflakes *.py tests/*.py
-      - name: Тесты (от root: chroot, смена владельца, fork от nobody)
+      - name: "Тесты от root (chroot, смена владельца, fork от nobody)"
         env:
           COMPOSE_BIN: /tmp/docker-compose
         run: |
