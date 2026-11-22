@@ -150,3 +150,7 @@ sudo -E python3 tests/test_policy.py    # политика на «злых» com
 sudo -E python3 tests/sim_git.py        # симуляция NAS для source=git
 sudo -E python3 tests/sim_releases.py   # симуляция NAS для source=releases
 ```
+
+## Лицензия
+
+MIT, см. [LICENSE](LICENSE).
