@@ -82,23 +82,35 @@ NAS, поэтому:
 
 Про новый major приходит одно письмо. Переходишь на него сам.
 
-## Установка на Synology
-
-1. Положи файлы в `/volume1/docker/nas-update/`: вне репозиториев
-   приложений и вне папок, которые видят контейнеры (nas-update это
-   проверяет).
-2. Скопируй примеры из `examples/` в `apps/<имя>.conf` и поправь пути.
-3. Snapshot Replication: снапшоты шар с данными чаще, чем
-   `snapshot_max_age` (например, homes — каждый час).
-4. Task Scheduler → Create → Scheduled Task → User-defined script, от root,
-   каждые 5 минут:
-   `sh /volume1/docker/nas-update/nas-update.sh`.
-   Включи письмо «only when the script terminates abnormally».
-5. Проверка без изменений:
-   `sh /volume1/docker/nas-update/nas-update.sh --dry-run`.
+## Установка и обновление на Synology
 
 Нужны DSM 7 (там есть python3 3.8 и git) и Container Manager. Docker
 compose 2.29.7 nas-update скачивает сам и сверяет по sha256.
+
+1. Папка — `/volume1/docker/nas-update/`: вне репозиториев приложений и вне
+   папок, которые видят контейнеры (nas-update это проверяет). Положи в
+   `apps/<имя>.conf` конфиги по примерам из `examples/`.
+2. Snapshot Replication: снапшоты шар с данными чаще, чем
+   `snapshot_max_age` (например, homes — каждый час).
+3. Task Scheduler → Create → Scheduled Task → User-defined script, от root,
+   **без расписания** (запускаешь руками), «nas-update install». `C` —
+   полный sha коммита, который ты прочитал:
+   ```sh
+   D=/volume1/docker/nas-update
+   C=0123456789abcdef0123456789abcdef01234567
+   mkdir -p $D/apps && cd $D || exit 2
+   [ -d .git ] || git init -q
+   git fetch -q --depth 1 https://github.com/coppermilk/nas-update $C || exit 2
+   git checkout -qf --detach $C || exit 2
+   git rev-parse HEAD
+   sh $D/nas-update.sh --dry-run
+   ```
+   Запусти и посмотри вывод: какой коммит стоит и что nas-update сделал бы.
+   **Обновление** nas-update — та же задача с новым `C`, после того как
+   прочитал diff. `apps/` и `state/` git не трогает.
+4. Вторая задача — от root, каждые 5 минут:
+   `sh /volume1/docker/nas-update/nas-update.sh`.
+   Включи письмо «only when the script terminates abnormally».
 
 ## Письма и коды выхода
 
