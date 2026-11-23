@@ -27,7 +27,8 @@ import sys
 import tarfile
 
 from core import (DOCKER, GIT, SYNOACL, App, Failed, Stop, compose, compose_bin,
-                  inspect, log, read_json, remove_old_images, require_snapshot, sh, under,
+                  inspect, log, project_containers, read_json, remove_old_images,
+                  require_snapshot, restart_counts, sh, sick_containers, under,
                   wait_healthy, write_json)
 
 # ---------------------------------------------------------------- политика
@@ -295,6 +296,11 @@ class GitApp(App):
     def guarded_paths(self):
         return [self.repo, self.policy.data] + self.policy.readonly
 
+    def version_info(self):
+        """Что стоит сейчас — для отчёта о версии на сайт (report.py)."""
+        cur = self.current() or {}
+        return {'commit': cur.get('commit'), 'image': cur.get('image'), 'branch': self.branch}
+
     def check_user(self):
         try:
             self.pw = pwd.getpwnam(self.run_as)
@@ -514,6 +520,29 @@ class GitApp(App):
         elif r['bad']:
             log('ВНИМАНИЕ: обновляю всё равно, проверка здоровья покажет')
 
+    # --- между обновлениями: живы ли контейнеры, самолечение
+    def watch(self, cur):
+        """Контейнеры текущей версии не running/healthy — поднять заново тем же JSON;
+        не поднялись — Stop(2, kind=health): письмо и отчёт один раз в 6 ч."""
+        cs = project_containers(self.project)
+        sick = sick_containers(cs)
+        if cs and not sick:
+            return
+        names = ', '.join(c['Name'].lstrip('/') for c in sick) or 'контейнеров нет'
+        log('контейнеры не в порядке: %s — поднимаю заново' % names)
+        for c in sick:
+            for line in sh(DOCKER, 'logs', '--tail', '15', c['Id'], check=False, merge=True).splitlines():
+                log('    | ' + line, stamp=False)
+        try:
+            self.dc('up', '-d', '--remove-orphans')
+        except Failed:
+            self.dc('up', '-d', '--remove-orphans')
+        if wait_healthy(self.project, self.verify_sec, 0, baseline=restart_counts(self.project)):
+            self.outcome = {'event': 'heal', 'message': 'контейнеры упали (%s), перезапущены, все живы' % names,
+                            'commit': cur['commit'], 'image': cur['image']}
+            return
+        raise Stop(2, 'контейнеры не поднимаются после перезапуска: %s' % names, 'health')
+
     # --- что сейчас работает
     def current(self):
         cur = read_json(self.current_file)
@@ -569,9 +598,11 @@ class GitApp(App):
         self.key = self.version_key(new, new_id)
         if self.key == cur['key']:
             log('изменений нет')
+            self.watch(cur)
             return 0
         if self.rejected():
             log('эту версию уже отклонил: %s. Жду новый коммит, образ или правку' % self.rejected())
+            self.watch(cur)
             return 0
 
         log('новое: %s, образ %s' % (self.describe(new), new_id[7:19]))
@@ -588,8 +619,12 @@ class GitApp(App):
             self.remember(new, new_id, deploy, self.key)
             remove_old_images([self.policy.image_repo], [new_id])
             log('готово')
+            # для отчёта о версии на сайт (report.py)
+            self.outcome = {'event': 'deploy', 'message': 'обновлено до %s' % new[:12], 'commit': new,
+                            'prev_commit': cur['commit'], 'image': new_id}
             return 0
         log('новая версия не поднялась, откатываюсь на %s' % cur['commit'][:12])
+        self.outcome = {'event': 'rollback', 'commit': cur['commit'], 'prev_commit': new, 'image': cur['image']}
         if self.apply(cur['commit'], cur['image'], cur['deploy']):
             raise Stop(4, 'новая версия упала, откат удался: работает прежняя')
         raise Stop(5, 'ОТКАТ ТОЖЕ НЕ ПОДНЯЛСЯ, нужен ручной разбор', 'broken')

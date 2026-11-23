@@ -181,6 +181,13 @@ class ReleaseApp(App):
             os.path.basename(f), (datetime.datetime.now().timestamp() - os.path.getmtime(f)) / 3600)
 
     # --- сценарий
+    def version_info(self):
+        """Что стоит сейчас — для отчёта о версии на сайт (report.py)."""
+        try:
+            return {'version': vtag(self.current_version())}
+        except Exception:
+            return {}
+
     def run(self):
         major = self.tracked_major()
         current, ours = self.running()
@@ -227,8 +234,11 @@ class ReleaseApp(App):
         if self.switch(target.v):
             remove_old_images(self.images, [i for _, i in self.running()[1].values()])
             log('готово: %s' % target.tag)
+            self.outcome = {'event': 'deploy', 'message': 'обновлено до %s' % target.tag, 'version': target.tag,
+                            'prev_version': vtag(current)}  # для отчёта о версии на сайт
             return code
         log('новая версия не поднялась, возвращаю %s' % vtag(current))
+        self.outcome = {'event': 'rollback', 'version': vtag(current), 'prev_version': target.tag}
         if self.switch(current):
             raise Stop(4, '%s не поднялся, вернул %s' % (target.tag, vtag(current)))
         raise Stop(5, 'не поднялся ни %s, ни %s. Восстанови из снапшота шары с %s или из дампа базы'

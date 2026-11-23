@@ -114,6 +114,28 @@ compose 2.29.7 nas-update скачивает сам и сверяет по sha25
    `sh /volume1/docker/nas-update/nas-update.sh`.
    Включи письмо «only when the script terminates abnormally».
 
+## Отчёт о версии на сайт
+
+Облако не видит NAS, поэтому nas-update сам сообщает разделу «Версии» админки
+сайта, что стоит и чем кончилось обновление (`report.py`; из репозиториев
+приложений по-прежнему ничего не исполняется). Включается разделом в
+`apps/<имя>.conf`:
+
+```ini
+[report]
+url             = https://daetotyoma.com/admin/versions/minion2-nas
+key_file        = /volume1/docker/nas-update/secrets/versions.key
+heartbeat_hours = 24
+```
+
+`key_file` — файл только для root с ключом сайта (`BOARD_KEY`); можно и
+`key = …` прямо в конфиге (он тоже локальный). События: `deploy` после
+удачного обновления, `rollback` после отката, `error`, когда обновление
+заблокировано или упало (шлётся один раз, как письмо), `heartbeat` раз в
+`heartbeat_hours` — «жив, стоит такой-то коммит». Сайт недоступен — отчёт ждёт
+в `state/<имя>/report-outbox.jsonl` и досылается при следующем запуске. Отчёт
+никогда не ломает обновление и не шлётся в `--dry-run`.
+
 ## Письма и коды выхода
 
 | код | что значит |
@@ -137,6 +159,7 @@ compose 2.29.7 nas-update скачивает сам и сверяет по sha25
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 
@@ -149,6 +172,7 @@ export COMPOSE_BIN=/path/to/docker-compose-2.29.7
 sudo -E python3 tests/test_policy.py    # политика на «злых» compose
 sudo -E python3 tests/sim_git.py        # симуляция NAS для source=git
 sudo -E python3 tests/sim_releases.py   # симуляция NAS для source=releases
+python3 tests/test_report.py             # отчёт о версии: без root и сети
 ```
 
 ## Лицензия

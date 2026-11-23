@@ -35,6 +35,7 @@ import core  # noqa: E402
 from core import LOG, App, Failed, Stop, load_conf, log, under  # noqa: E402
 from git_source import GitApp  # noqa: E402
 from release_source import ReleaseApp  # noqa: E402
+from report import Reporter  # noqa: E402
 
 SOURCES = {'git': GitApp, 'releases': ReleaseApp}
 APPS = core.APPS
@@ -44,13 +45,16 @@ def run_app(name, dry):
     """Одно приложение: код выхода, ошибки и письма — только его."""
     LOG['app'] = name
     app = None
+    rep = None  # отчёт о версии на сайт ([report] в конфиге, report.py)
     try:
         c = load_conf(os.path.join(APPS, name + '.conf'))
         source = SOURCES.get(c.get('source', ''))
         if not source:
             raise Stop(2, '%s.conf: source = git или releases' % name, 'config')
         app = source(name, c, dry)
+        rep = Reporter(app, c.parser['report'] if c.parser.has_section('report') else None, dry)
         if not app.due():
+            rep.heartbeat()
             return 0
         log('===== %s =====' % ('dry-run: ничего не меняю' if dry else 'старт'))
         for root in app.guarded_paths():
@@ -62,18 +66,32 @@ def run_app(name, dry):
         app = app or App(name, None, dry)
         if e.kind is None:
             app.mark_done()
-        return app.stopped(e)
+        rc = app.stopped(e)
+        if rep:
+            rep.stopped(e, rc)
+        return rc
     except Failed as e:
-        return (app or App(name, None, dry)).stopped(Stop(2, str(e), 'error'))
+        app = app or App(name, None, dry)
+        e = Stop(2, str(e), 'error')
+        rc = app.stopped(e)
+        if rep:
+            rep.stopped(e, rc)
+        return rc
     except Exception as e:  # ошибка в самом nas-update
         for line in traceback.format_exc().splitlines():
             log('  ' + line, stamp=False)
-        return (app or App(name, None, dry)).stopped(Stop(2, 'сбой nas-update: %r' % e, 'crash'))
+        app = app or App(name, None, dry)
+        e = Stop(2, 'сбой nas-update: %r' % e, 'crash')
+        rc = app.stopped(e)
+        if rep:
+            rep.stopped(e, rc)
+        return rc
     finally:
         LOG['app'] = ''
     if not dry:
         app.clear_alerts()
     app.mark_done()
+    rep.after_run(code)
     return code
 
 

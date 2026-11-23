@@ -183,6 +183,15 @@ def restart_counts(project):
     return {c['Id']: c['RestartCount'] for c in project_containers(project)}
 
 
+def sick_containers(cs, baseline=None):
+    """Контейнеры, которые не running, не healthy (если есть healthcheck) или
+    перезапускались сверх baseline — чистая проверка для wait_healthy и watch."""
+    baseline = baseline or {}
+    return [c for c in cs if c['State']['Status'] != 'running'
+            or (c['State'].get('Health') or {}).get('Status', 'healthy') != 'healthy'
+            or c['RestartCount'] > baseline.get(c['Id'], 0)]
+
+
 def wait_healthy(project, settle, timeout, check=None, baseline=None):
     """Через settle секунд и дальше до timeout: все контейнеры проекта
     running, healthy (если есть healthcheck), без новых перезапусков и
@@ -194,9 +203,7 @@ def wait_healthy(project, settle, timeout, check=None, baseline=None):
     deadline = time.time() + timeout
     while True:
         cs = project_containers(project)
-        sick = [c for c in cs if c['State']['Status'] != 'running'
-                or (c['State'].get('Health') or {}).get('Status', 'healthy') != 'healthy'
-                or c['RestartCount'] > baseline.get(c['Id'], 0)]
+        sick = sick_containers(cs, baseline)
         good = bool(cs) and not sick and (check() if check else True)
         if good:
             log('все контейнеры живы')
