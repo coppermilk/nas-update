@@ -159,7 +159,7 @@ heartbeat_hours = 24
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat; при отказе сайта пишет в лог его ответ («не задан секрет BOARD_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 

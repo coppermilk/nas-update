@@ -42,6 +42,7 @@ class Reporter:
         self.dry = dry
         self.send = send or self._send
         self.url = self.key = ''
+        self.last_reply = ''  # первая строка ответа сайта при отказе (4xx/5xx) — в лог, чтобы причина была видна
         self.heartbeat_hours = 24
         self.host = 'nas-' + (socket.gethostname() or 'nas')
         if section is None:
@@ -91,10 +92,15 @@ class Reporter:
         req = urllib.request.Request(self.url, data=data, method='PUT', headers={
             'Content-Type': 'application/json; charset=utf-8', 'X-Board-Key': self.key,
             'User-Agent': 'nas-update'})
+        self.last_reply = ''
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 return r.status
         except urllib.error.HTTPError as e:
+            try:
+                self.last_reply = e.read(400).decode('utf-8', 'replace').strip().splitlines()[0][:200]
+            except Exception:
+                self.last_reply = ''
             return e.code
         except (urllib.error.URLError, OSError, socket.timeout):
             return 0
@@ -139,7 +145,12 @@ class Reporter:
                     f.write(json.dumps(body, ensure_ascii=False) + '\n')
                 log('отчёт о версии: сайт недоступен, %s отложен' % event)
                 return False
-            log('отчёт о версии: сайт отверг %s (%d) — проверь url и key в [report]' % (event, code))
+            log('отчёт о версии: сайт отверг %s (%d)%s' % (event, code, (' — ' + self.last_reply) if self.last_reply else ''))
+            if code == 401:
+                log('отчёт о версии: ключ из key_file не совпал с секретом BOARD_KEY сайта или секрет на сайте не задан — '
+                    'сверь значение (без пробелов и переносов) и Cloudflare → Pages → Variables and Secrets → Production')
+            elif code == 404:
+                log('отчёт о версии: проверь url в [report] — сайт не знает такой адрес')
             return False
         except Exception as e:  # ни при каких условиях не ломать обновление
             log('отчёт о версии не отправлен: %r' % e)

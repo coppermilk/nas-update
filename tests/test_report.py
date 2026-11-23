@@ -101,11 +101,29 @@ def test_outbox_when_offline():
     assert [b['event'] for b in sent[-2:]] == ['deploy', 'heartbeat']
 
 
-def test_rejected_not_queued():
+def test_rejected_not_queued(capsys=None):
     app = FakeApp('f')
     r = reporter(app)
     codes.extend([401])
     assert r.post('deploy', True, 'x') is False and not os.path.exists(r.outbox_path())
+
+
+def test_rejected_logs_site_reply():
+    # сайт ответил 401 с текстом — текст и подсказка про BOARD_KEY попадают в лог, а не глотаются
+    import io
+    import contextlib
+    app = FakeApp('g')
+    r = reporter(app)
+
+    def send_401(body):
+        r.last_reply = 'На сайте не задан секрет BOARD_KEY'
+        return 401
+    r.send = send_401
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert r.post('deploy', True, 'x') is False
+    text = out.getvalue()
+    assert 'отверг deploy (401) — На сайте не задан секрет BOARD_KEY' in text and 'BOARD_KEY' in text
 
 
 def test_dry_run_silent():
