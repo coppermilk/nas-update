@@ -109,21 +109,21 @@ def test_rejected_not_queued(capsys=None):
 
 
 def test_rejected_logs_site_reply():
-    # сайт ответил 401 с текстом — текст и подсказка про BOARD_KEY попадают в лог, а не глотаются
+    # сайт ответил 401 с текстом — текст и подсказка про VERSIONS_KEY попадают в лог, а не глотаются
     import io
     import contextlib
     app = FakeApp('g')
     r = reporter(app)
 
     def send_401(body):
-        r.last_reply = 'На сайте не задан секрет BOARD_KEY'
+        r.last_reply = 'На сайте не задан секрет VERSIONS_KEY'
         return 401
     r.send = send_401
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         assert r.post('deploy', True, 'x') is False
     text = out.getvalue()
-    assert 'отверг deploy (401) — На сайте не задан секрет BOARD_KEY' in text and 'BOARD_KEY' in text
+    assert 'отверг deploy (401) — На сайте не задан секрет VERSIONS_KEY' in text and 'VERSIONS_KEY' in text
 
 
 def test_dry_run_silent():

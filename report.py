@@ -147,7 +147,7 @@ class Reporter:
                 return False
             log('отчёт о версии: сайт отверг %s (%d)%s' % (event, code, (' — ' + self.last_reply) if self.last_reply else ''))
             if code == 401:
-                log('отчёт о версии: ключ из key_file не совпал с секретом BOARD_KEY сайта или секрет на сайте не задан — '
+                log('отчёт о версии: ключ из key_file не совпал с секретом VERSIONS_KEY сайта или секрет на сайте не задан — '
                     'сверь значение (без пробелов и переносов) и Cloudflare → Pages → Variables and Secrets → Production')
             elif code == 404:
                 log('отчёт о версии: проверь url в [report] — сайт не знает такой адрес')

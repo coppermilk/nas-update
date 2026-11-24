@@ -128,7 +128,7 @@ key_file        = /volume1/docker/nas-update/secrets/versions.key
 heartbeat_hours = 24
 ```
 
-`key_file` — файл только для root с ключом сайта (`BOARD_KEY`); можно и
+`key_file` — файл только для root с ключом сайта (`VERSIONS_KEY`); можно и
 `key = …` прямо в конфиге (он тоже локальный). События: `deploy` после
 удачного обновления, `rollback` после отката, `error`, когда обновление
 заблокировано или упало (шлётся один раз, как письмо), `heartbeat` раз в
@@ -159,7 +159,7 @@ heartbeat_hours = 24
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat; при отказе сайта пишет в лог его ответ («не задан секрет BOARD_KEY» / «ключ не совпал») |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 
