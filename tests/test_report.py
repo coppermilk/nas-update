@@ -12,7 +12,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import core  # noqa: E402
 from core import Stop  # noqa: E402
-from report import Reporter  # noqa: E402
+from report import DETAILS_LIMIT, Reporter, fit_details, catalog_summary, js_length  # noqa: E402
+
+CATALOG = os.path.join(HERE, 'fixtures', 'emoji_catalog.json')
 
 TMP = tempfile.mkdtemp(prefix='nas-update-report-')
 core.STATE = TMP
@@ -53,7 +55,8 @@ def reporter(app, **over):
 def test_disabled_without_section():
     app = FakeApp('a')
     r = Reporter(app, None, send=fake_send)
-    assert not r.enabled and r.post('deploy', True, 'x') is False and not sent
+    n = len(sent)
+    assert not r.enabled and r.post('deploy', True, 'x') is False and len(sent) == n
 
 
 def test_payload_and_deploy():
@@ -133,6 +136,125 @@ def test_dry_run_silent():
     n = len(sent)
     r.after_run(0)
     assert len(sent) == n
+
+
+def test_summary_from_catalog_fixture():
+    app = FakeApp('s1')
+    r = reporter(app, summary_file=CATALOG)
+    r.after_run(0)
+    d = sent[-1]['details']['emoji_catalog']
+    assert d['sets_read'] is True and d['generated_at'] == '2026-11-26T13:00:00Z'
+    assert d['sets_count'] == 2 and d['emoji_count'] == 5
+    assert d['emoji_by_source'] == {'set': 3, 'channel': 2, 'constants': 1}, 'эмодзи в двух источниках считается в обоих'
+    assert d['sets'] == [{'short_name': 'TyomaPack', 'title': 'Tyoma', 'count': 2},
+                         {'short_name': 'CatsVienna', 'title': 'Котики Вены', 'count': 1}]
+    assert 'sets_more' not in d
+    assert all('id' not in one for one in d['sets']), 'в отчёт идут наборы, а не сами эмодзи'
+
+
+def test_summary_on_deploy_too():
+    app = FakeApp('s2')
+    app.outcome = {'event': 'deploy', 'message': 'обновлено', 'commit': 'abc'}
+    reporter(app, summary_file=CATALOG).after_run(0)
+    assert sent[-1]['event'] == 'deploy' and sent[-1]['details']['emoji_catalog']['sets_count'] == 2
+
+
+def test_no_summary_key_no_details():
+    app = FakeApp('s3')
+    reporter(app).after_run(0)
+    assert 'details' not in sent[-1]
+
+
+def _report_with_file(name, content):
+    import io
+    import contextlib
+    app = FakeApp(name)
+    path = app.path('catalog.json')
+    if content is not None:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        reporter(app, summary_file=path).after_run(0)
+    return sent[-1], out.getvalue()
+
+
+def test_missing_file_report_goes_without_summary():
+    body, logged = _report_with_file('s4', None)
+    assert body['event'] == 'heartbeat' and 'details' not in body
+    assert 'summary_file' in logged and 'без сводки' in logged
+
+
+def test_broken_json_report_goes_without_summary():
+    body, logged = _report_with_file('s5', '{"sets": [')
+    assert body['event'] == 'heartbeat' and 'details' not in body and 'без сводки' in logged
+
+
+def test_not_an_object_report_goes_without_summary():
+    body, logged = _report_with_file('s6', '[1, 2]')
+    assert 'details' not in body and 'не объект' in logged
+
+
+def test_deep_nesting_report_goes_without_summary():
+    body, logged = _report_with_file('s7', '[' * 100000)
+    assert 'details' not in body and 'без сводки' in logged
+
+
+def test_symlink_not_followed():
+    # файл пишет контейнер: ссылка на чужой файл хоста не читается
+    app = FakeApp('s8')
+    link = app.path('link.json')
+    os.symlink(CATALOG, link)
+    reporter(app, summary_file=link).after_run(0)
+    assert 'details' not in sent[-1]
+
+
+def test_fifo_does_not_hang():
+    app = FakeApp('s9')
+    fifo = app.path('fifo.json')
+    os.mkfifo(fifo)
+    reporter(app, summary_file=fifo).after_run(0)
+    assert 'details' not in sent[-1]
+
+
+def _many_sets(n):
+    return {'generated_at': 'x', 'sets_read': True, 'emoji': [],
+            'sets': [{'short_name': 'Set%03d' % i, 'title': 'Котики и эмодзи 🐰 %03d' % i, 'count': i} for i in range(n)]}
+
+
+def test_fit_trims_sets_to_limit():
+    details = fit_details({'emoji_catalog': catalog_summary(_many_sets(200))})
+    d = details['emoji_catalog']
+    assert js_length(details) <= DETAILS_LIMIT
+    assert d['sets_count'] == 200 and d['sets_more'] == 200 - len(d['sets']) > 0
+    assert d['sets'][0]['short_name'] == 'Set000', 'обрезается хвост, начало списка на месте'
+    with_one_more = {'emoji_catalog': dict(d, sets=d['sets'] + [{'short_name': 'x', 'title': 'x', 'count': 1}])}
+    assert js_length(with_one_more) > DETAILS_LIMIT - 30, 'обрезано не больше нужного'
+
+
+def test_fit_exact_limit_untouched():
+    details = {'emoji_catalog': catalog_summary(_many_sets(3))}
+    size = js_length(details)
+    assert 'sets_more' not in fit_details(details, limit=size)['emoji_catalog']
+    assert fit_details(details, limit=size - 1)['emoji_catalog']['sets_more'] == 1
+
+
+def test_fit_thousands_of_sets_fast():
+    started = time.time()
+    details = fit_details({'emoji_catalog': catalog_summary(_many_sets(20000))})
+    assert js_length(details) <= DETAILS_LIMIT and details['emoji_catalog']['sets_more'] > 19000
+    assert time.time() - started < 2
+
+
+def test_js_length_counts_utf16():
+    assert js_length('🐰') == 4 and js_length('ж') == 3  # кавычки + 2 единицы UTF-16 у 🐰, 1 у ж
+
+
+def test_long_names_capped():
+    cat = {'sets': [{'short_name': 'a' * 500, 'title': 'б' * 500, 'count': -5}], 'emoji': [{'source': 'set'}]}
+    d = catalog_summary(cat)
+    assert len(d['sets'][0]['short_name']) == 64 and len(d['sets'][0]['title']) == 64 and d['sets'][0]['count'] == 0
+    assert d['emoji_by_source']['set'] == 1
 
 
 def test_sick_containers():

@@ -1,0 +1,15 @@
+{
+ "generated_at": "2026-11-26T13:00:00Z",
+ "sets_read": true,
+ "sets": [
+  {"short_name": "TyomaPack", "title": "Tyoma", "count": 2},
+  {"short_name": "CatsVienna", "title": "Котики Вены", "count": 1}
+ ],
+ "emoji": [
+  {"id": "777", "fallback": "🐰", "source": ["set", "channel"], "set": "TyomaPack"},
+  {"id": "778", "fallback": "🔥", "source": ["set"], "set": "TyomaPack"},
+  {"id": "779", "fallback": "😺", "source": ["set"], "set": "CatsVienna"},
+  {"id": "5368324170671202286", "fallback": "👍", "source": ["constants"], "type": "like"},
+  {"id": "900", "fallback": "✨", "source": ["channel"]}
+ ]
+}
