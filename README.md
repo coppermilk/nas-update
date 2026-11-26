@@ -136,6 +136,19 @@ heartbeat_hours = 24
 в `state/<имя>/report-outbox.jsonl` и досылается при следующем запуске. Отчёт
 никогда не ломает обновление и не шлётся в `--dry-run`.
 
+Необязательный `summary_file` — путь к каталогу премиум-эмодзи юзербота
+minion2 (`emoji_catalog.json`): в `details` каждого отчёта уходит его сводка —
+`{emoji_catalog: {generated_at, sets_read, sets_count, emoji_count,
+emoji_by_source: {set, channel, constants}, sets: [{short_name, title, count}],
+sets_more?}}`, не длиннее 4000 знаков (лимит сайта; лишние наборы с конца —
+в `sets_more`). Файл пишет контейнер, поэтому nas-update читает только обычный
+файл до 2 МБ и не идёт по ссылкам; нет файла или он битый — отчёт уходит без
+сводки, строка в журнал.
+
+```ini
+summary_file    = /volume1/@docker/volumes/minion2_aggregator-state/_data/emoji_catalog.json
+```
+
 ## Письма и коды выхода
 
 | код | что значит |
@@ -159,7 +172,7 @@ heartbeat_hours = 24
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat, сводка `summary_file` в details; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 

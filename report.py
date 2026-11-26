@@ -8,6 +8,14 @@
   url             = https://daetotyoma.com/admin/versions/minion2-nas
   key_file        = /volume1/docker/nas-update/secrets/versions.key   # или key = …
   heartbeat_hours = 24
+  summary_file    = /volume1/@docker/volumes/minion2_aggregator-state/_data/emoji_catalog.json
+
+summary_file (необязательно) — каталог премиум-эмодзи юзербота (emoji_catalog.json
+из minion2): его краткая сводка уходит в details каждого отчёта, чтобы команда
+видела наборы через MCP versions/version_history. Файл пишет контейнер, то есть
+недоверенный код: читаем без перехода по ссылкам, только обычный файл до
+SUMMARY_MAX_BYTES, в отчёт — только числа и короткие строки. Файла нет или он
+битый — отчёт уходит без сводки, строка в журнал.
 
 События: deploy (обновилось), rollback (новая версия упала, откат удался),
 error (заблокировано, нет снапшота, сбой, откат не поднялся), heartbeat (раз в
@@ -20,6 +28,7 @@ state/<имя>/report-outbox.jsonl и досылается при следующ
 import json
 import os
 import socket
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -28,10 +37,86 @@ from core import log, read_json, write_json
 
 EVENTS = ('deploy', 'rollback', 'heartbeat', 'error')
 TIMEOUT = 20
+DETAILS_LIMIT = 4000  # LIMITS.details сайта (workers/go/src/versions.mjs): длиннее — обрезанный и уже не JSON
+SUMMARY_MAX_BYTES = 2 * 1024 * 1024
+SUMMARY_SOURCES = ('set', 'channel', 'constants')
+NAME_MAX = 64
 
 
 def utc_now():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def js_length(value):
+    """Длина JSON.stringify(value) в JS (единицы UTF-16) — так сайт меряет details."""
+    text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+    return len(text.encode('utf-16-le')) // 2
+
+
+def read_untrusted_json(path):
+    """JSON из файла, который пишет контейнер: не ссылка, не FIFO, не больше SUMMARY_MAX_BYTES.
+
+    Бросает OSError или ValueError с причиной: root не должен ни зависнуть на FIFO,
+    ни прочитать по ссылке чужой файл.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError('не обычный файл')
+        if st.st_size > SUMMARY_MAX_BYTES:
+            raise ValueError('больше %d байт' % SUMMARY_MAX_BYTES)
+        data = os.read(fd, SUMMARY_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    return json.loads(data.decode('utf-8'))
+
+
+def _name(value):
+    return str(value or '')[:NAME_MAX]
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def catalog_summary(catalog):
+    """Сводка emoji_catalog.json: наборы и число эмодзи по источникам, без самих эмодзи."""
+    if not isinstance(catalog, dict):
+        raise ValueError('каталог — не объект JSON')
+    sets = catalog.get('sets') if isinstance(catalog.get('sets'), list) else []
+    emoji = catalog.get('emoji') if isinstance(catalog.get('emoji'), list) else []
+    by_source = dict.fromkeys(SUMMARY_SOURCES, 0)
+    for row in emoji:
+        sources = row.get('source') if isinstance(row, dict) else None
+        for src in sources if isinstance(sources, list) else [sources]:
+            if src in by_source:
+                by_source[src] += 1
+    return {
+        'generated_at': _name(catalog.get('generated_at')),
+        'sets_read': catalog.get('sets_read') is True,
+        'sets_count': len(sets),
+        'emoji_count': len(emoji),
+        'emoji_by_source': by_source,
+        'sets': [{'short_name': _name(one.get('short_name')), 'title': _name(one.get('title')),
+                  'count': _count(one.get('count'))} for one in sets if isinstance(one, dict)],
+    }
+
+
+def fit_details(details, limit=DETAILS_LIMIT):
+    """Уложить {'emoji_catalog': сводка} в limit: лишние наборы с конца — в счётчик sets_more («ещё N»)."""
+    summary = details['emoji_catalog']
+    total = len(summary['sets'])
+    # пустой набор в JSON — {"short_name":"","title":"","count":0}, 38 знаков: больше limit // 38 не влезет
+    # никогда, а срез сразу держит цикл ниже коротким и при тысячах наборов
+    shown = summary['sets'][:limit // 38]
+    while True:
+        summary['sets'] = shown
+        if len(shown) < total:
+            summary['sets_more'] = total - len(shown)
+        if js_length(details) <= limit or not shown:
+            return details
+        shown = shown[:-1]
 
 
 class Reporter:
@@ -44,6 +129,7 @@ class Reporter:
         self.url = self.key = ''
         self.last_reply = ''  # первая строка ответа сайта при отказе (4xx/5xx) — в лог, чтобы причина была видна
         self.heartbeat_hours = 24
+        self.summary_file = ''
         self.host = 'nas-' + (socket.gethostname() or 'nas')
         if section is None:
             return
@@ -58,6 +144,7 @@ class Reporter:
                 log('отчёт о версии: key_file не прочитан (%s)' % e)
         self.key = key
         self.host = section.get('host', self.host).strip() or self.host
+        self.summary_file = section.get('summary_file', '').strip()
         try:
             self.heartbeat_hours = float(section.get('heartbeat_hours', '24'))
         except ValueError:
@@ -83,7 +170,21 @@ class Reporter:
                 'finished_at': utc_now()}
         body.update({k: v for k, v in self.info().items() if v})
         body.update({k: v for k, v in extra.items() if v is not None})
+        if 'details' not in body:
+            details = self.details()
+            if details:
+                body['details'] = details
         return body
+
+    def details(self):
+        """Сводка summary_file для details; без ключа или с битым файлом — None и строка в журнал."""
+        if not self.summary_file:
+            return None
+        try:
+            return fit_details({'emoji_catalog': catalog_summary(read_untrusted_json(self.summary_file))})
+        except (OSError, ValueError, RecursionError) as e:  # RecursionError — JSON глубокой вложенности
+            log('отчёт о версии: summary_file %s не прочитан (%s) — отчёт без сводки' % (self.summary_file, e))
+            return None
 
     # --- отправка
     def _send(self, body):
