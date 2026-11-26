@@ -165,6 +165,35 @@ relay_file      = /volume1/@docker/volumes/minion2_aggregator-state/_data/tgedit
 relay_url       = https://daetotyoma.com/admin/versions/minion2-tgedit
 ```
 
+### Общий канал контейнер → сайт (`outbox_dir`)
+
+Одна строка в `[report]` на приложение — и дальше любой новый вид сообщения
+с NAS на сайт не требует ни правки conf, ни нового коммита nas-update:
+
+```ini
+outbox_dir      = /volume1/@docker/volumes/minion2_aggregator-state/_data/outbox
+```
+
+- **Кто пишет:** контейнер кладёт в эту папку файлы `<вид>.json` (вид —
+  `^[a-z0-9-]{1,32}$`), атомарно (временный файл + переименование).
+- **Формат:** объект JSON с `v: 1`, не длиннее 16 000 знаков (лимит сайта).
+- **Куда:** nas-update при каждом запуске шлёт файл `PUT <url>/<вид>`
+  (`url` — тот же адрес `[report]`, например
+  `https://daetotyoma.com/admin/versions/minion2-nas/tgedit-report`) тем же
+  ключом, телом `{host, sent_at, body}`, — только когда смысл файла изменился
+  (`generated_at` в отпечаток не входит; отпечатки —
+  `state/<имя>/outbox-sent.json`).
+- **Кто решает, что принимать:** сайт (список видов в его коде). Неизвестный
+  вид — 422 и строка в журнал; тот же файл повторяется раз в сутки или когда
+  изменится. Сети нет, ключ не принят или сайт упал — повтор при следующем
+  запуске.
+- **Осторожность:** папку пишет контейнер, поэтому папка-ссылка и файлы-ссылки
+  не читаются, файлы открываются относительно открытой папки, не больше 16
+  файлов за запуск; битый файл — строка в журнал, остальные уходят.
+
+Старая пара `relay_file` + `relay_url` работает, пока приложение не перешло на
+outbox.
+
 ## Письма и коды выхода
 
 | код | что значит |
@@ -188,7 +217,7 @@ relay_url       = https://daetotyoma.com/admin/versions/minion2-tgedit
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat, сводка `summary_file` в details, пересылка `relay_file` на `relay_url`; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat, сводка `summary_file` в details, пересылка `relay_file` на `relay_url`, общий канал `outbox_dir` (`<вид>.json` → `<url>/<вид>`); при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 

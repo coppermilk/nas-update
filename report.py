@@ -28,6 +28,16 @@ details отчёта другого проекта сайта, когда его
 длиннее DETAILS_LIMIT — не шлём, строка в журнал. Не ушло — уйдёт при
 следующем запуске (отпечаток отправленного — state/<имя>/report-relay.json).
 
+  outbox_dir      = /volume1/@docker/volumes/minion2_aggregator-state/_data/outbox
+
+outbox_dir (необязательно) — общий канал контейнер → сайт: каждый файл
+<вид>.json в этой папке (вид — ^[a-z0-9-]{1,32}$, объект JSON с v: 1, до
+OUTBOX_LIMIT знаков) уходит PUT на <url>/<вид> тем же ключом, когда меняется
+его смысл (generated_at в отпечаток не входит). Какие виды принимать, решает
+сайт (неизвестный — 422, строка в журнал, повтор через сутки или когда файл
+изменится), поэтому новый вид сообщения — это PR в приложение и в сайт, без
+правки conf и nas-update. Отпечатки — state/<имя>/outbox-sent.json.
+
 События: deploy (обновилось), rollback (новая версия упала, откат удался),
 error (заблокировано, нет снапшота, сбой, откат не поднялся), heartbeat (раз в
 heartbeat_hours: «жив, стоит такой-то коммит»). Сайт недоступен — отчёт ждёт в
@@ -39,6 +49,7 @@ state/<имя>/report-outbox.jsonl и досылается при следующ
 import hashlib
 import json
 import os
+import re
 import socket
 import stat
 import time
@@ -53,6 +64,11 @@ DETAILS_LIMIT = 4000  # LIMITS.details сайта (workers/go/src/versions.mjs):
 SUMMARY_MAX_BYTES = 2 * 1024 * 1024
 SUMMARY_SOURCES = ('set', 'channel', 'constants')
 NAME_MAX = 64
+OUTBOX_LIMIT = 16000  # BODY_LIMIT сайта (workers/go/src/inbox.mjs)
+OUTBOX_FILES = 16  # файлов за запуск: папку пишет контейнер, root не должен по его воле слать без конца
+OUTBOX_RETRY_SEC = 24 * 3600  # отвергнутое сайтом (4xx) не шлём снова, пока файл тот же, — раз в сутки
+OUTBOX_NAME = re.compile(r'^([a-z0-9-]{1,32})\.json$')
+OUTBOX_VERSION = 1
 
 
 def utc_now():
@@ -65,13 +81,13 @@ def js_length(value):
     return len(text.encode('utf-16-le')) // 2
 
 
-def read_untrusted_json(path):
+def read_untrusted_json(path, dir_fd=None):
     """JSON из файла, который пишет контейнер: не ссылка, не FIFO, не больше SUMMARY_MAX_BYTES.
 
     Бросает OSError или ValueError с причиной: root не должен ни зависнуть на FIFO,
-    ни прочитать по ссылке чужой файл.
+    ни прочитать по ссылке чужой файл. dir_fd — открытая папка: path внутри неё.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -82,6 +98,35 @@ def read_untrusted_json(path):
     finally:
         os.close(fd)
     return json.loads(data.decode('utf-8'))
+
+
+def meaning_digest(body):
+    """Отпечаток смысла файла: generated_at — время пересборки, не новость (иначе каждый перезапуск — новая отправка)."""
+    meaning = {k: v for k, v in body.items() if k != 'generated_at'}
+    return hashlib.sha256(json.dumps(meaning, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def read_outbox(path, limit=OUTBOX_FILES):
+    """[(вид, тело или исключение)] файлов <вид>.json папки path, по имени, не больше limit.
+
+    Папка, файл-ссылка и не обычный файл не читаются: папку пишет контейнер. Файлы
+    открываются относительно открытой папки, так что подмена папки ссылкой между
+    списком и чтением ничего не даст. Бросает OSError, если папку не открыть.
+    """
+    dir_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        kinds = sorted(m.group(1) for m in map(OUTBOX_NAME.match, os.listdir(dir_fd)) if m)
+        out = []
+        for kind in kinds[:limit]:
+            try:
+                out.append((kind, read_untrusted_json(kind + '.json', dir_fd=dir_fd)))
+            except (OSError, ValueError, RecursionError) as e:
+                out.append((kind, e))
+        if len(kinds) > limit:
+            log('outbox: файлов %d, за запуск шлю %d по имени: %s' % (len(kinds), limit, ', '.join(kinds[limit:])))
+        return out
+    finally:
+        os.close(dir_fd)
 
 
 def _name(value):
@@ -143,6 +188,7 @@ class Reporter:
         self.heartbeat_hours = 24
         self.summary_file = ''
         self.relay_file = self.relay_url = ''
+        self.outbox_dir = ''
         self.host = 'nas-' + (socket.gethostname() or 'nas')
         if section is None:
             return
@@ -158,6 +204,7 @@ class Reporter:
         self.key = key
         self.host = section.get('host', self.host).strip() or self.host
         self.summary_file = section.get('summary_file', '').strip()
+        self.outbox_dir = section.get('outbox_dir', '').strip()
         self.relay_file = section.get('relay_file', '').strip()
         self.relay_url = section.get('relay_url', '').strip().rstrip('/')
         if bool(self.relay_file) != bool(self.relay_url):
@@ -302,10 +349,8 @@ class Reporter:
             return False
         try:
             mark = self.app.path('report-relay.json')
-            # generated_at — время пересборки файла, не его смысл: движок пишет новое при каждом старте, и без этого
-            # каждый перезапуск контейнера ложился бы новой строкой в историю отчётов сайта (она держит 50 строк)
-            meaning = {k: v for k, v in body.items() if k != 'generated_at'}
-            digest = hashlib.sha256(json.dumps(meaning, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+            # без generated_at в отпечатке: иначе каждый перезапуск контейнера ложился бы новой строкой в историю сайта (50 строк)
+            digest = meaning_digest(body)
             if read_json(mark, {}).get('sha256') == digest:
                 return False
             report = {'event': 'heartbeat', 'ok': True, 'host': self.host, 'finished_at': utc_now(),
@@ -323,8 +368,58 @@ class Reporter:
             log('пересылка не удалась: %r' % e)
             return False
 
+    def outbox(self):
+        """Файлы outbox_dir → PUT <url>/<вид>, когда смысл файла изменился. Сколько ушло; никогда не бросает."""
+        if not (self.enabled and self.outbox_dir):
+            return 0
+        try:
+            files = read_outbox(self.outbox_dir)
+        except OSError as e:
+            log('outbox: папка %s не открыта (%s) — не шлю' % (self.outbox_dir, e))
+            return 0
+        try:
+            mark = self.app.path('outbox-sent.json')
+            sent = read_json(mark, {})
+            sent = sent if isinstance(sent, dict) else {}
+            done = 0
+            for kind, body in files:
+                if self._send_one(kind, body, sent):
+                    done += 1
+            write_json(mark, sent)
+            return done
+        except Exception as e:  # ни при каких условиях не ломать обновление
+            log('outbox: отправка не удалась: %r' % e)
+            return 0
+
+    def _send_one(self, kind, body, sent):
+        """Один файл outbox; итог — в sent[kind] ({sha256, at, code}), когда сайт ответил окончательно."""
+        problem = (str(body) if isinstance(body, Exception) else 'не объект JSON' if not isinstance(body, dict)
+                   else 'нет v: %d' % OUTBOX_VERSION if body.get('v') != OUTBOX_VERSION
+                   else 'длиннее %d знаков' % OUTBOX_LIMIT if js_length(body) > OUTBOX_LIMIT else '')
+        if problem:
+            log('outbox: %s.json не шлю (%s)' % (kind, problem))
+            return False
+        digest = meaning_digest(body)
+        last = sent.get(kind) if isinstance(sent.get(kind), dict) else {}
+        if last.get('sha256') == digest:
+            accepted = 200 <= int(last.get('code') or 0) < 300
+            if accepted or time.time() - float(last.get('at') or 0) < OUTBOX_RETRY_SEC:
+                return False
+        code = self.send({'host': self.host, 'sent_at': utc_now(), 'body': body}, '%s/%s' % (self.url, kind))
+        reply = (' — ' + self.last_reply) if self.last_reply else ''
+        if 200 <= code < 300:
+            log('outbox: %s → сайт принял' % kind)
+        elif code in (0, 401, 429) or code >= 500:  # сеть, ключ или сайт — не вина файла: повтор при следующем запуске
+            log('outbox: %s — сайт %s (%d)%s, повторю при следующем запуске' % (kind, 'недоступен' if code == 0 else 'отверг', code, reply))
+            return False
+        else:  # 4xx про сам файл (422 — вид сайт не принимает): тот же файл — не раньше чем через OUTBOX_RETRY_SEC
+            log('outbox: %s — сайт отверг (%d)%s; тот же файл повторю через сутки' % (kind, code, reply))
+        sent[kind] = {'sha256': digest, 'at': time.time(), 'code': code}
+        return 200 <= code < 300
+
     def after_run(self, code):
-        """После app.run() без Stop: пересылка relay_file и отчёт об обновлении, иначе heartbeat."""
+        """После app.run() без Stop: outbox, пересылка relay_file и отчёт об обновлении, иначе heartbeat."""
+        self.outbox()
         self.relay()
         outcome = getattr(self.app, 'outcome', None)
         if outcome:
@@ -336,7 +431,8 @@ class Reporter:
             self.heartbeat()
 
     def stopped(self, e, rc):
-        """После Stop: пересылка relay_file; отчёт — только о новых проблемах (rc != 0 — письмо тоже идёт один раз)."""
+        """После Stop: outbox и пересылка relay_file; отчёт — только о новых проблемах (rc != 0 — письмо тоже идёт один раз)."""
+        self.outbox()
         self.relay()
         if rc == 0:
             return
