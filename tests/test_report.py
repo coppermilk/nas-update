@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import core  # noqa: E402
 from core import Stop  # noqa: E402
-from report import DETAILS_LIMIT, Reporter, fit_details, catalog_summary, js_length  # noqa: E402
+from report import DETAILS_LIMIT, OUTBOX_FILES, OUTBOX_LIMIT, OUTBOX_RETRY_SEC, Reporter, fit_details, catalog_summary, js_length  # noqa: E402
 
 CATALOG = os.path.join(HERE, 'fixtures', 'emoji_catalog.json')
 
@@ -350,6 +350,114 @@ def test_relay_after_stop_too():
     n = len(relayed)
     r.stopped(Stop(0, 'ждём'), 0)
     assert len(relayed) == n + 1
+
+
+# --- outbox: общий канал контейнер → сайт (№170)
+REPORT_URL = 'https://daetotyoma.com/admin/versions/minion2-nas'
+
+
+def _outbox(name):
+    """Приложение, папка outbox и отчётчик с одной строкой outbox_dir в [report]."""
+    app = FakeApp(name)
+    box = os.path.join(TMP, name + '-outbox')
+    os.makedirs(box, exist_ok=True)
+    return app, box, reporter(app, outbox_dir=box)
+
+
+def _put(box, kind, body):
+    import json
+    with open(os.path.join(box, kind + '.json'), 'w', encoding='utf-8') as f:
+        f.write(body if isinstance(body, str) else json.dumps(body, ensure_ascii=False))
+
+
+def _sent_to(kind):
+    return [body for url, body in relayed if url == '%s/%s' % (REPORT_URL, kind)]
+
+
+def test_outbox_any_new_kind_goes_to_its_url_without_conf_change():
+    """Новый вид — только новый файл в папке: conf и код nas-update те же."""
+    _, box, r = _outbox('o1')
+    _put(box, 'tgedit-report', {'v': 1, 'generated_at': '2026-11-26T14:00:00Z', 'packages': []})
+    _put(box, 'some-future-kind', {'v': 1, 'n': 7})
+    assert r.outbox() == 2
+    future = _sent_to('some-future-kind')[-1]
+    assert future['body'] == {'v': 1, 'n': 7} and future['host'].startswith('nas-') and future['sent_at'].endswith('Z')
+    assert _sent_to('tgedit-report')[-1]['body']['packages'] == []
+
+
+def test_outbox_resends_only_when_meaning_changed():
+    _, box, r = _outbox('o2')
+    _put(box, 'tgedit-report', {'v': 1, 'generated_at': '2026-11-26T12:00:00Z', 'packages': []})
+    assert r.outbox() == 1
+    _put(box, 'tgedit-report', {'v': 1, 'generated_at': '2026-11-26T13:00:00Z', 'packages': []})
+    assert r.outbox() == 0, 'другое только generated_at — не новость'
+    _put(box, 'tgedit-report', {'v': 1, 'generated_at': '2026-11-26T13:00:00Z', 'packages': [{'id': '1-x'}]})
+    assert r.outbox() == 1
+
+
+def test_outbox_retries_network_but_not_refused_file():
+    import io
+    import contextlib
+    app, box, r = _outbox('o3')
+    _put(box, 'unknown-kind', {'v': 1})
+    codes.extend([0])
+    assert r.outbox() == 0 and r.outbox() == 1, 'сети нет — повтор при следующем запуске'
+    _put(box, 'unknown-kind', {'v': 1, 'x': 1})
+    codes.extend([422])
+    r.last_reply = ''
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert r.outbox() == 0
+    assert 'отверг (422)' in out.getvalue()
+    n = len(_sent_to('unknown-kind'))
+    assert r.outbox() == 0 and len(_sent_to('unknown-kind')) == n, 'тот же отвергнутый файл не шлём каждый запуск'
+    core.write_json(app.path('outbox-sent.json'), dict(core.read_json(app.path('outbox-sent.json'), {}), **{
+        'unknown-kind': dict(core.read_json(app.path('outbox-sent.json'), {})['unknown-kind'], at=time.time() - OUTBOX_RETRY_SEC - 1)}))
+    assert r.outbox() == 1, 'через сутки — снова (сайт мог научиться виду)'
+
+
+def test_outbox_reads_only_regular_kind_files_of_a_real_dir():
+    import io
+    import contextlib
+    app, box, r = _outbox('o4')
+    secret = os.path.join(TMP, 'o4-secret.json')
+    with open(secret, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "secret": true}')
+    os.symlink(secret, os.path.join(box, 'linked.json'))
+    _put(box, 'Bad_Name', {'v': 1})
+    with open(os.path.join(box, 'tmpab12.part'), 'w', encoding='utf-8') as f:
+        f.write('{"v": 1}')  # недописанный файл атомарной записи
+    _put(box, 'no-version', {'packages': []})
+    _put(box, 'not-object', '[1]')
+    _put(box, 'too-long', {'v': 1, 'x': 'a' * OUTBOX_LIMIT})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert r.outbox() == 0
+    said = out.getvalue()
+    assert 'linked.json не шлю' in said and 'нет v: 1' in said and 'не объект' in said and 'длиннее' in said
+    assert not any('secret' in str(body) for _, body in relayed)
+    link = os.path.join(TMP, 'o4-link')
+    os.symlink(box, link)
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert reporter(app, outbox_dir=link).outbox() == 0, 'папка-ссылка не читается'
+        assert reporter(app, outbox_dir=os.path.join(TMP, 'нет-такой')).outbox() == 0
+
+
+def test_outbox_caps_files_per_run():
+    _, box, r = _outbox('o5')
+    for i in range(OUTBOX_FILES + 3):
+        _put(box, 'k%02d' % i, {'v': 1})
+    assert r.outbox() == OUTBOX_FILES
+
+
+def test_outbox_silent_without_dir_or_in_dry_run_and_runs_after_stop():
+    app, box, r = _outbox('o6')
+    _put(box, 'tgedit-report', {'v': 1, 'packages': []})
+    assert reporter(app).outbox() == 0
+    assert Reporter(app, Section(url=REPORT_URL, key='k', outbox_dir=box), dry=True, send=fake_send).outbox() == 0
+    n = len(_sent_to('tgedit-report'))
+    r.stopped(Stop(0, 'ждём'), 0)
+    assert len(_sent_to('tgedit-report')) == n + 1
 
 
 if __name__ == '__main__':
