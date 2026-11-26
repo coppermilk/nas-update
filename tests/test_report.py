@@ -41,8 +41,11 @@ sent = []
 codes = []
 
 
-def fake_send(body):
-    sent.append(body)
+relayed = []
+
+
+def fake_send(body, url=None):
+    (relayed if url else sent).append((url, body) if url else body)
     return codes.pop(0) if codes else 201
 
 
@@ -266,6 +269,73 @@ def test_sick_containers():
     assert sick_containers([run]) == []
     assert [c['Id'] for c in sick_containers([run, unhealthy, exited, restarted])] == ['2', '3', '4']
     assert sick_containers([restarted], baseline={'4': 2}) == []
+
+
+TGEDIT = os.path.join(HERE, 'fixtures', 'tgedit_report.json')
+RELAY_URL = 'https://daetotyoma.com/admin/versions/minion2-tgedit'
+
+
+def _relayer(name, path=TGEDIT):
+    app = FakeApp(name)
+    return app, reporter(app, relay_file=path, relay_url=RELAY_URL)
+
+
+def test_relay_sends_file_as_details_to_its_project():
+    _, r = _relayer('r1')
+    n = len(sent)
+    r.after_run(0)
+    url, body = relayed[-1]
+    assert url == RELAY_URL and body['event'] == 'heartbeat' and body['ok'] is True
+    assert [p['id'] for p in body['details']['packages']] == ['576-viewer-pin', '475-cleanup'], 'файл уходит как есть'
+    assert len(sent) == n + 1 and 'details' not in sent[-1], 'отчёт minion2-nas идёт своим чередом, без итога'
+
+
+def test_relay_only_when_file_changed():
+    app, r = _relayer('r2', path=os.path.join(TMP, 'r2.json'))
+    with open(r.relay_file, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "packages": []}')
+    n = len(relayed)
+    assert r.relay() is True and r.relay() is False and len(relayed) == n + 1
+    with open(r.relay_file, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "packages": [{"id": "1-x"}]}')
+    assert r.relay() is True and len(relayed) == n + 2
+
+
+def test_relay_retries_after_refusal():
+    _, r = _relayer('r3')
+    codes.extend([0])
+    assert r.relay() is False, 'сети нет — отпечаток не пишем'
+    assert r.relay() is True
+
+
+def test_relay_refuses_non_object_and_too_long():
+    import io
+    import contextlib
+    path = os.path.join(TMP, 'r4.json')
+    for content, says in (('[1]', 'не объект'), ('{"x": "%s"}' % ('a' * DETAILS_LIMIT), 'длиннее')):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        _, r = _relayer('r4', path=path)
+        n = len(relayed)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert r.relay() is False
+        assert len(relayed) == n and says in out.getvalue()
+
+
+def test_relay_needs_both_keys_and_is_silent_in_dry_run():
+    app = FakeApp('r5')
+    r = reporter(app, relay_file=TGEDIT)
+    assert r.relay_file == '' and r.relay() is False
+    dry = Reporter(app, Section(url='u', key='k', relay_file=TGEDIT, relay_url=RELAY_URL), dry=True, send=fake_send)
+    assert dry.relay() is False
+
+
+def test_relay_after_stop_too():
+    _, r = _relayer('r6')
+    n = len(relayed)
+    r.stopped(Stop(0, 'ждём'), 0)
+    assert len(relayed) == n + 1
 
 
 if __name__ == '__main__':

@@ -149,6 +149,21 @@ sets_more?}}`, не длиннее 4000 знаков (лимит сайта; л�
 summary_file    = /volume1/@docker/volumes/minion2_aggregator-state/_data/emoji_catalog.json
 ```
 
+Необязательная пара `relay_file` + `relay_url` — пересылка файла-итога, который
+пишет контейнер: редактор канала minion2 кладёт `tgedit_report.json` (что из
+пакетов фида `/tgedit.json` выполнено, что пропущено и почему), nas-update при
+каждом запуске сверяет его отпечаток с отправленным
+(`state/<имя>/report-relay.json`) и, если файл изменился, шлёт его как есть в
+`details` отчёта на `relay_url` тем же ключом. Так сайт убирает выполненные
+правки из фида, а ключ сайта остаётся у root, не в контейнере. Файл читается
+так же осторожно; не объект JSON или длиннее 4000 знаков — не шлём, строка в
+журнал; сайт недоступен — повтор при следующем запуске.
+
+```ini
+relay_file      = /volume1/@docker/volumes/minion2_aggregator-state/_data/tgedit_report.json
+relay_url       = https://daetotyoma.com/admin/versions/minion2-tgedit
+```
+
 ## Письма и коды выхода
 
 | код | что значит |
@@ -172,7 +187,7 @@ summary_file    = /volume1/@docker/volumes/minion2_aggregator-state/_data/emoji_
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat, сводка `summary_file` в details; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, error, heartbeat, сводка `summary_file` в details, пересылка `relay_file` на `relay_url`; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 
