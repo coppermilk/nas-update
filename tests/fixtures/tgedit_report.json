@@ -1,0 +1,8 @@
+{
+ "v": 1,
+ "generated_at": "2026-11-26T12:00:00Z",
+ "packages": [
+  {"id": "576-viewer-pin", "mode": "on", "at": "2026-11-26T11:46:30Z", "items": [[0, "pin_new", "applied"]]},
+  {"id": "475-cleanup", "mode": "on", "at": "2026-11-26T11:46:10Z", "items": [[1142, "delete", "applied"], [944, "edit", "skipped", "not_found"]]}
+ ]
+}

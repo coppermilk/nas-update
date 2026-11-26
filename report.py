@@ -17,6 +17,17 @@ summary_file (необязательно) — каталог премиум-эм
 SUMMARY_MAX_BYTES, в отчёт — только числа и короткие строки. Файла нет или он
 битый — отчёт уходит без сводки, строка в журнал.
 
+  relay_file      = /volume1/@docker/volumes/minion2_aggregator-state/_data/tgedit_report.json
+  relay_url       = https://daetotyoma.com/admin/versions/minion2-tgedit
+
+relay_file + relay_url (необязательно, вместе) — файл-итог, который пишет
+контейнер (tgedit_report.json редактора канала minion2), уходит как есть в
+details отчёта другого проекта сайта, когда его содержимое изменилось, — тем же
+ключом. Так сайт узнаёт, какие правки канала выполнены, а ключ сайта остаётся
+у root, а не в контейнере. Читается так же осторожно; не объект JSON или
+длиннее DETAILS_LIMIT — не шлём, строка в журнал. Не ушло — уйдёт при
+следующем запуске (отпечаток отправленного — state/<имя>/report-relay.json).
+
 События: deploy (обновилось), rollback (новая версия упала, откат удался),
 error (заблокировано, нет снапшота, сбой, откат не поднялся), heartbeat (раз в
 heartbeat_hours: «жив, стоит такой-то коммит»). Сайт недоступен — отчёт ждёт в
@@ -25,6 +36,7 @@ state/<имя>/report-outbox.jsonl и досылается при следующ
 
 Совместимо с Python 3.8 (системный python3 в DSM 7).
 """
+import hashlib
 import json
 import os
 import socket
@@ -130,6 +142,7 @@ class Reporter:
         self.last_reply = ''  # первая строка ответа сайта при отказе (4xx/5xx) — в лог, чтобы причина была видна
         self.heartbeat_hours = 24
         self.summary_file = ''
+        self.relay_file = self.relay_url = ''
         self.host = 'nas-' + (socket.gethostname() or 'nas')
         if section is None:
             return
@@ -145,6 +158,11 @@ class Reporter:
         self.key = key
         self.host = section.get('host', self.host).strip() or self.host
         self.summary_file = section.get('summary_file', '').strip()
+        self.relay_file = section.get('relay_file', '').strip()
+        self.relay_url = section.get('relay_url', '').strip().rstrip('/')
+        if bool(self.relay_file) != bool(self.relay_url):
+            log('отчёт о версии: relay_file и relay_url нужны вместе — пересылку не делаю')
+            self.relay_file = self.relay_url = ''
         try:
             self.heartbeat_hours = float(section.get('heartbeat_hours', '24'))
         except ValueError:
@@ -187,10 +205,10 @@ class Reporter:
             return None
 
     # --- отправка
-    def _send(self, body):
-        """PUT на сайт; код ответа, 0 — сети нет."""
+    def _send(self, body, url=None):
+        """PUT на сайт (url — адрес отчёта, по умолчанию url из [report]); код ответа, 0 — сети нет."""
         data = json.dumps(body, ensure_ascii=False).encode('utf-8')
-        req = urllib.request.Request(self.url, data=data, method='PUT', headers={
+        req = urllib.request.Request(url or self.url, data=data, method='PUT', headers={
             'Content-Type': 'application/json; charset=utf-8', 'X-Board-Key': self.key,
             'User-Agent': 'nas-update'})
         self.last_reply = ''
@@ -269,8 +287,42 @@ class Reporter:
             return True
         return False
 
+    def relay(self):
+        """relay_file → details отчёта на relay_url, когда файл изменился. Никогда не бросает."""
+        if not (self.enabled and self.relay_file):
+            return False
+        try:
+            body = read_untrusted_json(self.relay_file)
+            if not isinstance(body, dict):
+                raise ValueError('не объект JSON')
+            if js_length(body) > DETAILS_LIMIT:
+                raise ValueError('длиннее %d знаков' % DETAILS_LIMIT)
+        except (OSError, ValueError, RecursionError) as e:
+            log('пересылка: relay_file %s не прочитан (%s) — не шлю' % (self.relay_file, e))
+            return False
+        try:
+            mark = self.app.path('report-relay.json')
+            digest = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+            if read_json(mark, {}).get('sha256') == digest:
+                return False
+            report = {'event': 'heartbeat', 'ok': True, 'host': self.host, 'finished_at': utc_now(),
+                      'message': 'итог из %s' % os.path.basename(self.relay_file), 'details': body}
+            report.update({k: v for k, v in self.info().items() if v})
+            code = self.send(report, self.relay_url)
+            if 200 <= code < 300:
+                write_json(mark, {'sha256': digest, 'at': time.time()})
+                log('пересылка: %s → сайт принял' % os.path.basename(self.relay_file))
+                return True
+            log('пересылка: сайт %s (%d)%s — повторю при следующем запуске' % (
+                'недоступен' if code == 0 else 'отверг', code, (' — ' + self.last_reply) if self.last_reply else ''))
+            return False
+        except Exception as e:  # ни при каких условиях не ломать обновление
+            log('пересылка не удалась: %r' % e)
+            return False
+
     def after_run(self, code):
-        """После app.run() без Stop: отчёт об обновлении, иначе heartbeat."""
+        """После app.run() без Stop: пересылка relay_file и отчёт об обновлении, иначе heartbeat."""
+        self.relay()
         outcome = getattr(self.app, 'outcome', None)
         if outcome:
             o = dict(outcome)
@@ -281,7 +333,8 @@ class Reporter:
             self.heartbeat()
 
     def stopped(self, e, rc):
-        """После Stop: только о новых проблемах (rc != 0 — письмо тоже идёт один раз)."""
+        """После Stop: пересылка relay_file; отчёт — только о новых проблемах (rc != 0 — письмо тоже идёт один раз)."""
+        self.relay()
         if rc == 0:
             return
         outcome = getattr(self.app, 'outcome', None) or {}
