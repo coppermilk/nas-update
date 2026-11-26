@@ -302,7 +302,10 @@ class Reporter:
             return False
         try:
             mark = self.app.path('report-relay.json')
-            digest = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+            # generated_at — время пересборки файла, не его смысл: движок пишет новое при каждом старте, и без этого
+            # каждый перезапуск контейнера ложился бы новой строкой в историю отчётов сайта (она держит 50 строк)
+            meaning = {k: v for k, v in body.items() if k != 'generated_at'}
+            digest = hashlib.sha256(json.dumps(meaning, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
             if read_json(mark, {}).get('sha256') == digest:
                 return False
             report = {'event': 'heartbeat', 'ok': True, 'host': self.host, 'finished_at': utc_now(),

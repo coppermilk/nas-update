@@ -301,6 +301,20 @@ def test_relay_only_when_file_changed():
     assert r.relay() is True and len(relayed) == n + 2
 
 
+def test_relay_ignores_generated_at():
+    """Движок пересобирает итог при каждом старте с новым generated_at — это не новый итог, строки истории нет."""
+    _, r = _relayer('r5', path=os.path.join(TMP, 'r5.json'))
+    for at in ('2026-11-26T12:00:00Z', '2026-11-26T13:00:00Z'):
+        with open(r.relay_file, 'w', encoding='utf-8') as f:
+            f.write('{"v": 1, "generated_at": "%s", "packages": []}' % at)
+        n = len(relayed)
+        r.relay()
+    assert len(relayed) == n, 'второй файл отличается только generated_at — не шлём'
+    with open(r.relay_file, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "generated_at": "2026-11-26T14:00:00Z", "packages": [{"id": "1-x"}]}')
+    assert r.relay() is True
+
+
 def test_relay_retries_after_refusal():
     _, r = _relayer('r3')
     codes.extend([0])
