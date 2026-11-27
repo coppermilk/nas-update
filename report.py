@@ -39,10 +39,17 @@ OUTBOX_LIMIT знаков) уходит PUT на <url>/<вид> тем же кл
 правки conf и nas-update. Отпечатки — state/<имя>/outbox-sent.json.
 
 События: deploy (обновилось), rollback (новая версия упала, откат удался),
-error (заблокировано, нет снапшота, сбой, откат не поднялся), heartbeat (раз в
+heal (контейнеры упали, перезапущены и живы), error (заблокировано, нет
+снапшота, сбой, откат или перезапуск не поднялся), heartbeat (раз в
 heartbeat_hours: «жив, стоит такой-то коммит»). Сайт недоступен — отчёт ждёт в
 state/<имя>/report-outbox.jsonl и досылается при следующем запуске. Отчёт
 никогда не ломает обновление: любая ошибка — одна строка в журнал.
+
+В heal и error о больных контейнерах в details уходит containers: [{name,
+status, exit_code, restarts, log_tail}] — последние LOG_TAIL строк журнала,
+похожее на токены и ключи заменено на *** (core.redact). Причина важнее
+сводки каталога: не влезает в DETAILS_LIMIT — сначала уходит каталог, потом
+старые строки журнала.
 
 Совместимо с Python 3.8 (системный python3 в DSM 7).
 """
@@ -58,7 +65,7 @@ import urllib.request
 
 from core import log, read_json, write_json
 
-EVENTS = ('deploy', 'rollback', 'heartbeat', 'error')
+EVENTS = ('deploy', 'rollback', 'heal', 'heartbeat', 'error')  # EVENTS сайта (workers/go/src/versions.mjs)
 TIMEOUT = 20
 DETAILS_LIMIT = 4000  # LIMITS.details сайта (workers/go/src/versions.mjs): длиннее — обрезанный и уже не JSON
 SUMMARY_MAX_BYTES = 2 * 1024 * 1024
@@ -161,7 +168,23 @@ def catalog_summary(catalog):
 
 
 def fit_details(details, limit=DETAILS_LIMIT):
-    """Уложить {'emoji_catalog': сводка} в limit: лишние наборы с конца — в счётчик sets_more («ещё N»)."""
+    """Уложить details в limit: сначала наборы каталога с конца — в счётчик sets_more («ещё N»).
+
+    Причина падения важнее каталога: если с containers всё ещё длинно, каталог уходит
+    целиком, потом — старые строки log_tail самого длинного хвоста.
+    """
+    if 'emoji_catalog' in details:
+        fit_catalog(details, limit)
+    if js_length(details) > limit and details.get('containers'):
+        details.pop('emoji_catalog', None)
+        tails = [c['log_tail'] for c in details['containers']]
+        while js_length(details) > limit and any(tails):
+            max(tails, key=len).pop(0)
+    return details
+
+
+def fit_catalog(details, limit):
+    """Наборы details['emoji_catalog'] с конца — в sets_more, пока details длиннее limit."""
     summary = details['emoji_catalog']
     total = len(summary['sets'])
     # пустой набор в JSON — {"short_name":"","title":"","count":0}, 38 знаков: больше limit // 38 не влезет
@@ -242,11 +265,22 @@ class Reporter:
         return body
 
     def details(self):
-        """Сводка summary_file для details; без ключа или с битым файлом — None и строка в журнал."""
+        """details отчёта: больные контейнеры (app.containers от watch) и сводка summary_file; нечего — None."""
+        details = {}
+        containers = getattr(self.app, 'containers', None)
+        if containers:  # копия: fit_details укорачивает хвосты на месте
+            details['containers'] = [dict(c, log_tail=list(c['log_tail'])) for c in containers]
+        catalog = self.catalog()
+        if catalog:
+            details['emoji_catalog'] = catalog
+        return fit_details(details) if details else None
+
+    def catalog(self):
+        """Сводка summary_file; без ключа или с битым файлом — None и строка в журнал."""
         if not self.summary_file:
             return None
         try:
-            return fit_details({'emoji_catalog': catalog_summary(read_untrusted_json(self.summary_file))})
+            return catalog_summary(read_untrusted_json(self.summary_file))
         except (OSError, ValueError, RecursionError) as e:  # RecursionError — JSON глубокой вложенности
             log('отчёт о версии: summary_file %s не прочитан (%s) — отчёт без сводки' % (self.summary_file, e))
             return None
@@ -425,7 +459,7 @@ class Reporter:
         if outcome:
             o = dict(outcome)
             event = o.pop('event', 'deploy')
-            self.post(event, event == 'deploy', o.pop('message', 'обновлено'), **o)
+            self.post(event, event in ('deploy', 'heal'), o.pop('message', 'обновлено'), **o)
             return
         if code == 0:
             self.heartbeat()

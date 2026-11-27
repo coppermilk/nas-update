@@ -28,7 +28,7 @@ import tarfile
 
 from core import (DOCKER, GIT, SYNOACL, App, Failed, Stop, compose, compose_bin,
                   inspect, log, project_containers, read_json, remove_old_images,
-                  require_snapshot, restart_counts, sh, sick_containers, under,
+                  require_snapshot, restart_counts, sh, sick_containers, sick_reports, under,
                   wait_healthy, write_json)
 
 # ---------------------------------------------------------------- политика
@@ -530,17 +530,21 @@ class GitApp(App):
             return
         names = ', '.join(c['Name'].lstrip('/') for c in sick) or 'контейнеров нет'
         log('контейнеры не в порядке: %s — поднимаю заново' % names)
-        for c in sick:
-            for line in sh(DOCKER, 'logs', '--tail', '15', c['Id'], check=False, merge=True).splitlines():
-                log('    | ' + line, stamp=False)
+        # для details отчёта о версии (report.py): причину падения видно без входа на NAS
+        self.containers = sick_reports(sick)
+        for line in (l for r in self.containers for l in r['log_tail']):
+            log('    | ' + line, stamp=False)
         try:
             self.dc('up', '-d', '--remove-orphans')
         except Failed:
             self.dc('up', '-d', '--remove-orphans')
-        if wait_healthy(self.project, self.verify_sec, 0, baseline=restart_counts(self.project)):
+        baseline = restart_counts(self.project)
+        if wait_healthy(self.project, self.verify_sec, 0, baseline=baseline):
             self.outcome = {'event': 'heal', 'message': 'контейнеры упали (%s), перезапущены, все живы' % names,
                             'commit': cur['commit'], 'image': cur['image']}
             return
+        # после перезапуска журнал свежее: в отчёт — то, как контейнер упал снова
+        self.containers = sick_reports(sick_containers(project_containers(self.project), baseline)) or self.containers
         raise Stop(2, 'контейнеры не поднимаются после перезапуска: %s' % names, 'health')
 
     # --- что сейчас работает

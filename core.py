@@ -192,6 +192,43 @@ def sick_containers(cs, baseline=None):
             or c['RestartCount'] > baseline.get(c['Id'], 0)]
 
 
+LOG_TAIL = 20  # строк журнала больного контейнера в отчёт о версии
+LOG_LINE_MAX = 300
+ANSI = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+# журнал пишет контейнер: всё, похожее на секрет, — *** до того, как строка уйдёт с NAS
+SECRETS = [
+    (re.compile(r'\b(?:bot)?\d{6,12}:[\w-]{30,}'), '***'),  # токен бота Telegram, с bot в адресе API и без
+    (re.compile(r'\bbot\d+:[\w-]+'), '***'),
+    (re.compile(r'(?i)\bbearer\s+\S+'), 'Bearer ***'),
+    (re.compile(r'(?i)\b(api_hash|api_id|token|secret|password|passwd|session|key)\b(["\']?\s*[:=]\s*["\']?)[^\s"\',;&]+'),
+     r'\1\2***'),
+    (re.compile(r'(?i)\b[0-9a-f]{32,}\b'), '***'),  # api_hash и прочие ключи в hex
+    (re.compile(r'[A-Za-z0-9+/_=-]{60,}'), '***'),  # строки сессий и base64-ключи
+]
+
+
+def redact(line):
+    """Строка журнала для отчёта: без цветовых кодов, без похожего на секреты, не длиннее LOG_LINE_MAX."""
+    line = ANSI.sub('', line)
+    for pattern, repl in SECRETS:
+        line = pattern.sub(repl, line)
+    return line[:LOG_LINE_MAX]
+
+
+def container_report(c, logs):
+    """Больной контейнер для details отчёта: состояние и хвост журнала logs без секретов."""
+    state = c.get('State') or {}
+    return {'name': c.get('Name', '').lstrip('/'), 'status': state.get('Status'),
+            'exit_code': state.get('ExitCode'), 'restarts': c.get('RestartCount'),
+            'log_tail': [redact(l) for l in logs.splitlines()[-LOG_TAIL:]]}
+
+
+def sick_reports(cs):
+    """[container_report] больных контейнеров cs с их журналами из docker logs."""
+    return [container_report(c, sh(DOCKER, 'logs', '--tail', str(LOG_TAIL), c['Id'], check=False, merge=True))
+            for c in cs]
+
+
 def wait_healthy(project, settle, timeout, check=None, baseline=None):
     """Через settle секунд и дальше до timeout: все контейнеры проекта
     running, healthy (если есть healthcheck), без новых перезапусков и

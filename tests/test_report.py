@@ -460,6 +460,90 @@ def test_outbox_silent_without_dir_or_in_dry_run_and_runs_after_stop():
     assert len(_sent_to('tgedit-report')) == n + 1
 
 
+# --- больные контейнеры в details (№205): причина падения видна без входа на NAS
+def _sick(name='minion2-telegram-1', lines=3):
+    return {'name': name, 'status': 'exited', 'exit_code': 1, 'restarts': 4,
+            'log_tail': ['Traceback строка %d' % i for i in range(lines)]}
+
+
+def test_heal_is_reported_with_containers():
+    app = FakeApp('h1')
+    app.outcome = {'event': 'heal', 'message': 'контейнеры упали (minion2-telegram-1), перезапущены, все живы',
+                   'commit': 'abc1234567890', 'image': 'sha256:deadbeef'}
+    app.containers = [_sick()]
+    n = len(sent)
+    reporter(app).after_run(0)
+    assert len(sent) == n + 1, 'heal — событие сайта, его нельзя молча терять'
+    assert sent[-1]['event'] == 'heal' and sent[-1]['ok'] is True
+    assert sent[-1]['details']['containers'][0]['log_tail'][-1] == 'Traceback строка 2'
+
+
+def test_health_error_carries_containers_and_keeps_outbox_and_relay():
+    app = FakeApp('h2')
+    box = os.path.join(TMP, 'h2-outbox')
+    os.makedirs(box)
+    _put(box, 'tgedit-report', {'v': 1, 'packages': ['h2']})
+    r = reporter(app, outbox_dir=box, relay_file=TGEDIT, relay_url=RELAY_URL, summary_file=CATALOG)
+    app.containers = [_sick()]
+    def to_relay():
+        return [body for url, body in relayed if url == RELAY_URL]
+    out, rel = len(_sent_to('tgedit-report')), len(to_relay())
+    r.stopped(Stop(2, 'контейнеры не поднимаются после перезапуска: minion2-telegram-1', 'health'), 2)
+    assert len(_sent_to('tgedit-report')) == out + 1 and len(to_relay()) == rel + 1, 'больной контейнер не глушит канал'
+    d = sent[-1]['details']
+    assert sent[-1]['event'] == 'error' and d['containers'][0]['name'] == 'minion2-telegram-1'
+    assert d['containers'][0]['exit_code'] == 1 and d['containers'][0]['restarts'] == 4
+    assert d['emoji_catalog']['sets_count'] > 0, 'каталог остаётся, пока влезает'
+
+
+def test_health_error_repeat_silent_but_outbox_goes():
+    app = FakeApp('h3')
+    box = os.path.join(TMP, 'h3-outbox')
+    os.makedirs(box)
+    _put(box, 'tgedit-report', {'v': 1, 'packages': ['h3']})
+    r = reporter(app, outbox_dir=box)
+    n, out = len(sent), len(_sent_to('tgedit-report'))
+    r.stopped(Stop(2, 'контейнеры не поднимаются', 'health'), 0)  # уже сообщали в эти 6 ч
+    assert len(sent) == n and len(_sent_to('tgedit-report')) == out + 1
+
+
+def test_redact_secrets_in_logs():
+    from core import redact
+    token = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw'
+    assert token not in redact('POST https://api.telegram.org/bot%s/getMe 401' % token)
+    assert redact('bot42:short-tok_en x') == '*** x'
+    assert redact('Authorization: Bearer eyJhbGciOi.abc') == 'Authorization: Bearer ***'
+    assert redact('api_hash=0123456789abcdef0123456789abcdef api_id: 12345') == 'api_hash=*** api_id: ***'
+    assert redact('{"token": "s3cr3t", "password":"p"}') == '{"token": "***", "password":"***"}'
+    assert redact('session ' + 'A' * 80) == 'session ***'
+    assert redact('\x1b[31mERROR\x1b[0m: не подключился к DC2') == 'ERROR: не подключился к DC2'
+    assert len(redact('x ' * 500)) == 300
+
+
+def test_container_report_keeps_last_lines():
+    from core import LOG_TAIL, container_report
+    c = {'Id': '1', 'Name': '/minion2-telegram-1', 'State': {'Status': 'restarting', 'ExitCode': 137}, 'RestartCount': 9}
+    rep = container_report(c, '\n'.join('строка %d' % i for i in range(30)))
+    assert rep['name'] == 'minion2-telegram-1' and rep['status'] == 'restarting'
+    assert rep['exit_code'] == 137 and rep['restarts'] == 9
+    assert len(rep['log_tail']) == LOG_TAIL and rep['log_tail'][-1] == 'строка 29'
+
+
+def test_fit_prefers_containers_over_catalog():
+    long_tail = ['ошибка %03d ' % i + 'ж' * 250 for i in range(20)]
+    details = fit_details({'containers': [dict(_sick(), log_tail=list(long_tail))],
+                           'emoji_catalog': catalog_summary(_many_sets(200))})
+    assert js_length(details) <= DETAILS_LIMIT
+    assert 'emoji_catalog' not in details, 'каталог уходит раньше журнала'
+    tail = details['containers'][0]['log_tail']
+    assert tail and tail[-1] == long_tail[-1], 'обрезается начало хвоста, последние строки на месте'
+
+
+def test_fit_small_containers_untouched():
+    details = {'containers': [_sick()]}
+    assert fit_details(details) == {'containers': [_sick()]}
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):
