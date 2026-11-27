@@ -287,7 +287,7 @@ def test_relay_sends_file_as_details_to_its_project():
     url, body = relayed[-1]
     assert url == RELAY_URL and body['event'] == 'heartbeat' and body['ok'] is True
     assert [p['id'] for p in body['details']['packages']] == ['576-viewer-pin', '475-cleanup'], 'файл уходит как есть'
-    assert len(sent) == n + 1 and 'details' not in sent[-1], 'отчёт minion2-nas идёт своим чередом, без итога'
+    assert len(sent) == n + 1 and 'packages' not in str(sent[-1].get('details')), 'отчёт minion2-nas идёт своим чередом, без итога'
 
 
 def test_relay_only_when_file_changed():
@@ -542,6 +542,127 @@ def test_fit_prefers_containers_over_catalog():
 def test_fit_small_containers_untouched():
     details = {'containers': [_sick()]}
     assert fit_details(details) == {'containers': [_sick()]}
+
+
+# --- channel в details (№225): почему молчит канал NAS → сайт, видно в versions без входа на NAS
+def _channel_app(name):
+    app = FakeApp(name)
+    box = os.path.join(TMP, name + '-outbox')
+    os.makedirs(box, exist_ok=True)
+    relay = os.path.join(TMP, name + '-relay.json')
+    return app, box, relay, reporter(app, outbox_dir=box, relay_file=relay, relay_url=RELAY_URL)
+
+
+def _quiet(fn, *args):
+    import io
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*args)
+
+
+def test_channel_dir_missing():
+    app = FakeApp('c1')
+    missing = os.path.join(TMP, 'c1-нет-папки')
+    _quiet(reporter(app, outbox_dir=missing).after_run, 0)
+    box = sent[-1]['details']['channel']['outbox']
+    assert box['dir'] == missing and box['opened'] is False and 'No such file' in box['error']
+    assert 'files' not in box and box['sent'] == {}
+
+
+def test_channel_relay_file_missing():
+    app, _, relay, r = _channel_app('c2')
+    _quiet(r.after_run, 0)
+    rel = sent[-1]['details']['channel']['relay']
+    assert rel['file'] == relay and rel['opened'] is False and 'No such file' in rel['error']
+    assert rel['last'] is None and 'mtime' not in rel and 'sha256' not in rel
+
+
+def test_channel_file_present_and_unchanged():
+    """Файл есть, ушёл раньше и не меняется: видно его mtime, отпечаток и когда сайт принял — без тела файла."""
+    app, box, relay, r = _channel_app('c3')
+    _put(box, 'tgedit-report', {'v': 1, 'packages': ['секрет-тела']})
+    with open(relay, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "packages": []}')
+    _quiet(r.after_run, 0)
+    core.write_json(app.path('report-heartbeat.json'), {'at': 0})
+    r2 = reporter(app, outbox_dir=box, relay_file=relay, relay_url=RELAY_URL)
+    n = len(relayed)
+    _quiet(r2.after_run, 0)
+    assert len(relayed) == n, 'смысл не изменился — ничего не шлём'
+    ch = sent[-1]['details']['channel']
+    assert sent[-1]['event'] == 'heartbeat'
+    f = ch['outbox']['files'][0]
+    assert ch['outbox']['opened'] is True and f['kind'] == 'tgedit-report' and f['size'] > 0 and f['mtime'].endswith('Z')
+    assert 'error' not in f and ch['outbox']['sent']['tgedit-report']['code'] == 201
+    assert ch['relay']['opened'] is True and len(ch['relay']['sha256']) == 64 and ch['relay']['last']['code'] == 201
+    assert ch['relay']['mtime'].endswith('Z') and 'секрет-тела' not in str(ch)
+
+
+def test_channel_site_refused():
+    app, box, relay, r = _channel_app('c4')
+    _put(box, 'unknown-kind', {'v': 1})
+    with open(relay, 'w', encoding='utf-8') as f:
+        f.write('{"v": 1, "packages": []}')
+    codes.extend([422, 401, 201])  # outbox, relay, сам отчёт
+    _quiet(r.after_run, 0)
+    ch = sent[-1]['details']['channel']
+    assert ch['outbox']['sent']['unknown-kind']['code'] == 422 and ch['relay']['last']['code'] == 401
+    assert _quiet(r.relay) is True, '401 не записал отпечаток — повтор при следующем запуске'
+
+
+def test_channel_transient_failure_keeps_retry():
+    """Сеть упала: код виден в channel, но отпечаток прежний — файл уйдёт при следующем запуске."""
+    _, box, _, r = _channel_app('c5')
+    _put(box, 'tgedit-report', {'v': 1})
+    codes.extend([0])
+    assert _quiet(r.outbox) == 0 and r.channel['outbox']['sent']['tgedit-report']['code'] == 0
+    assert _quiet(r.outbox) == 1 and r.channel['outbox']['sent']['tgedit-report']['code'] == 201
+
+
+def test_channel_bad_file_listed_with_reason():
+    _, box, _, r = _channel_app('c6')
+    _put(box, 'no-version', {'packages': []})
+    _quiet(r.outbox)
+    assert r.channel['outbox']['files'] == [dict(r.channel['outbox']['files'][0], kind='no-version', error='нет v: 1')]
+
+
+def test_channel_in_every_event():
+    for event in ('deploy', 'heal'):
+        app, box, _, r = _channel_app('c7-' + event)
+        app.outcome = {'event': event, 'message': 'x', 'commit': 'abc'}
+        _quiet(r.after_run, 0)
+        assert sent[-1]['event'] == event and 'outbox' in sent[-1]['details']['channel']
+    app, box, _, r = _channel_app('c7-error')
+    _quiet(r.stopped, Stop(2, 'упало'), 2)
+    assert sent[-1]['event'] == 'error' and 'relay' in sent[-1]['details']['channel']
+
+
+def test_channel_without_keys_absent():
+    app = FakeApp('c8')
+    _quiet(reporter(app).after_run, 0)
+    assert 'details' not in sent[-1]
+
+
+def test_fit_drops_catalog_before_channel():
+    app, box, _, r = _channel_app('c9')
+    for i in range(OUTBOX_FILES):
+        _put(box, 'kind-%02d-%s' % (i, 'x' * 20), {'v': 1})
+    big = catalog_summary({'sets': [{'short_name': 's%d' % i, 'title': 'набор %d' % i, 'count': i} for i in range(300)],
+                           'emoji': []})
+    r.catalog = lambda: json_copy(big)
+    sick = _sick(lines=20)
+    sick['log_tail'] = [line + ' ' + 'y' * 280 for line in sick['log_tail']]
+    app.containers = [sick]
+    _quiet(r.stopped, Stop(2, 'упало'), 2)
+    d = sent[-1]['details']
+    assert js_length(d) <= DETAILS_LIMIT and 'emoji_catalog' not in d, 'каталог уходит первым'
+    assert len(d['channel']['outbox']['files']) == OUTBOX_FILES, 'channel целиком'
+    assert 0 < len(d['containers'][0]['log_tail']) < 20, 'хвост журнала укорочен, но причина есть'
+
+
+def json_copy(value):
+    import json
+    return json.loads(json.dumps(value))
 
 
 if __name__ == '__main__':

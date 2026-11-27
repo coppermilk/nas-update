@@ -209,6 +209,29 @@ outbox_dir      = /volume1/@docker/volumes/minion2_aggregator-state/_data/outbox
 Старая пара `relay_file` + `relay_url` работает, пока приложение не перешло на
 outbox.
 
+**Состояние канала в каждом отчёте.** Если в `[report]` есть `outbox_dir` или
+`relay_file`, в `details` каждого отчёта (deploy, rollback, heal, error,
+heartbeat) уходит `channel` — что этот запуск увидел в канале, без содержимого
+файлов:
+
+```json
+{"channel": {
+  "outbox": {"dir": "…/outbox", "opened": true, "error": "…",
+             "files": [{"kind": "tgedit-report", "size": 812, "mtime": "2026-11-27T07:28:00Z", "error": "…"}],
+             "sent": {"tgedit-report": {"code": 201, "at": "2026-11-26T14:25:00Z"}}},
+  "relay":  {"file": "…/tgedit_report.json", "opened": true, "error": "…",
+             "mtime": "2026-11-26T13:52:00Z", "sha256": "…",
+             "last": {"code": 201, "at": "2026-11-26T14:25:00Z"}}}}
+```
+
+`opened: false` и `error` — папку или файл не открыть (нет, ссылка, не
+обычный файл); `files[].error` — файл есть, но не уходит (битый, нет `v: 1`,
+длинный); `sent`/`last` — код и время последней попытки отправки (0 — сети
+нет, 4xx — сайт отверг), в том числе прошлых запусков. Старый `mtime` и
+неизменный `sha256` при `code` 2xx — файл не меняется, то есть движок его не
+переписывал. Пути — как в conf. Не влезает в 4000 знаков — сначала уходит
+каталог эмодзи, потом старые строки журнала контейнеров; `channel` остаётся.
+
 ## Письма и коды выхода
 
 | код | что значит |
@@ -232,7 +255,7 @@ outbox.
 | `core.py` | общее: журнал, письма, compose, снапшоты, здоровье, чистка образов |
 | `git_source.py` | `source = git`: клетка, политика, `run_as`, доступ к данным |
 | `release_source.py` | `source = releases`: релизы GitHub, задержка, стоп-сигналы |
-| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, heal, error, heartbeat, больные контейнеры с хвостом журнала без секретов в details, сводка `summary_file` в details, пересылка `relay_file` на `relay_url`, общий канал `outbox_dir` (`<вид>.json` → `<url>/<вид>`); при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
+| `report.py` | отчёт о версии на сайт (`[report]` в конфиге): deploy, rollback, heal, error, heartbeat, больные контейнеры с хвостом журнала без секретов в details, сводка `summary_file` в details, пересылка `relay_file` на `relay_url`, общий канал `outbox_dir` (`<вид>.json` → `<url>/<вид>`), состояние канала `channel` в details; при отказе сайта пишет в лог его ответ («не задан секрет VERSIONS_KEY» / «ключ не совпал») |
 | `apps/*.conf` | твои приложения (локально, не в git) |
 | `state/` | журнал `update.log` и состояние приложений (локально) |
 

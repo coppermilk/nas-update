@@ -51,6 +51,14 @@ status, exit_code, restarts, log_tail}] — последние LOG_TAIL стро
 сводки каталога: не влезает в DETAILS_LIMIT — сначала уходит каталог, потом
 старые строки журнала.
 
+Если в [report] есть outbox_dir или relay_file, в details каждого отчёта уходит
+channel — что этот запуск увидел в канале контейнер → сайт, без содержимого
+файлов: outbox {dir, opened, error, files: [{kind, size, mtime, error}],
+sent: {вид: {code, at}}} и relay {file, opened, error, mtime, sha256,
+last: {code, at}}. Так причина тишины канала (папки нет, файл не меняется,
+сайт отверг) видна в versions без входа на NAS. Каталог уходит из details
+раньше channel.
+
 Совместимо с Python 3.8 (системный python3 в DSM 7).
 """
 import hashlib
@@ -76,6 +84,7 @@ OUTBOX_FILES = 16  # файлов за запуск: папку пишет ко�
 OUTBOX_RETRY_SEC = 24 * 3600  # отвергнутое сайтом (4xx) не шлём снова, пока файл тот же, — раз в сутки
 OUTBOX_NAME = re.compile(r'^([a-z0-9-]{1,32})\.json$')
 OUTBOX_VERSION = 1
+ERROR_MAX = 200  # строка ошибки в channel: путь из conf + причина
 
 
 def utc_now():
@@ -107,6 +116,34 @@ def read_untrusted_json(path, dir_fd=None):
     return json.loads(data.decode('utf-8'))
 
 
+def iso(ts):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(float(ts)))
+
+
+def short_error(e):
+    return str(e)[:ERROR_MAX]
+
+
+def file_meta(path, dir_fd=None):
+    """{size, mtime} файла без перехода по ссылке; не прочитать — {}."""
+    try:
+        st = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return {}
+    return {'size': st.st_size, 'mtime': iso(st.st_mtime)}
+
+
+def last_attempt(entry):
+    """{code, at} последней отправки из отпечатка outbox-sent.json / report-relay.json; не было — None."""
+    last = entry.get('last') if isinstance(entry.get('last'), dict) else entry
+    if not isinstance(last, dict) or 'code' not in last:
+        return None
+    try:
+        return {'code': int(last['code']), 'at': iso(last.get('at') or 0)}
+    except (TypeError, ValueError, OverflowError, OSError):  # отпечаток испорчен руками — без last, отчёт не падает
+        return None
+
+
 def meaning_digest(body):
     """Отпечаток смысла файла: generated_at — время пересборки, не новость (иначе каждый перезапуск — новая отправка)."""
     meaning = {k: v for k, v in body.items() if k != 'generated_at'}
@@ -114,7 +151,7 @@ def meaning_digest(body):
 
 
 def read_outbox(path, limit=OUTBOX_FILES):
-    """[(вид, тело или исключение)] файлов <вид>.json папки path, по имени, не больше limit.
+    """[(вид, тело или исключение, {size, mtime})] файлов <вид>.json папки path, по имени, не больше limit.
 
     Папка, файл-ссылка и не обычный файл не читаются: папку пишет контейнер. Файлы
     открываются относительно открытой папки, так что подмена папки ссылкой между
@@ -125,10 +162,12 @@ def read_outbox(path, limit=OUTBOX_FILES):
         kinds = sorted(m.group(1) for m in map(OUTBOX_NAME.match, os.listdir(dir_fd)) if m)
         out = []
         for kind in kinds[:limit]:
+            name = kind + '.json'
             try:
-                out.append((kind, read_untrusted_json(kind + '.json', dir_fd=dir_fd)))
+                body = read_untrusted_json(name, dir_fd=dir_fd)
             except (OSError, ValueError, RecursionError) as e:
-                out.append((kind, e))
+                body = e
+            out.append((kind, body, file_meta(name, dir_fd=dir_fd)))
         if len(kinds) > limit:
             log('outbox: файлов %d, за запуск шлю %d по имени: %s' % (len(kinds), limit, ', '.join(kinds[limit:])))
         return out
@@ -167,14 +206,29 @@ def catalog_summary(catalog):
     }
 
 
+def outbox_problem(body):
+    """Почему файл outbox не шлём ('' — шлём): тело — исключение чтения или не то, что ждёт сайт."""
+    if isinstance(body, Exception):
+        return str(body)
+    if not isinstance(body, dict):
+        return 'не объект JSON'
+    if body.get('v') != OUTBOX_VERSION:
+        return 'нет v: %d' % OUTBOX_VERSION
+    if js_length(body) > OUTBOX_LIMIT:
+        return 'длиннее %d знаков' % OUTBOX_LIMIT
+    return ''
+
+
 def fit_details(details, limit=DETAILS_LIMIT):
     """Уложить details в limit: сначала наборы каталога с конца — в счётчик sets_more («ещё N»).
 
-    Причина падения важнее каталога: если с containers всё ещё длинно, каталог уходит
-    целиком, потом — старые строки log_tail самого длинного хвоста.
+    Причина падения и состояние канала важнее каталога: если с containers или channel
+    всё ещё длинно, каталог уходит целиком, потом — старые строки log_tail самого длинного хвоста.
     """
     if 'emoji_catalog' in details:
         fit_catalog(details, limit)
+    if js_length(details) > limit and (details.get('containers') or details.get('channel')):
+        details.pop('emoji_catalog', None)
     if js_length(details) > limit and details.get('containers'):
         details.pop('emoji_catalog', None)
         tails = [c['log_tail'] for c in details['containers']]
@@ -212,6 +266,7 @@ class Reporter:
         self.summary_file = ''
         self.relay_file = self.relay_url = ''
         self.outbox_dir = ''
+        self.channel = {}  # что outbox() и relay() увидели в этот запуск — в details отчёта
         self.host = 'nas-' + (socket.gethostname() or 'nas')
         if section is None:
             return
@@ -265,11 +320,13 @@ class Reporter:
         return body
 
     def details(self):
-        """details отчёта: больные контейнеры (app.containers от watch) и сводка summary_file; нечего — None."""
+        """details отчёта: больные контейнеры (app.containers от watch), канал и сводка summary_file; нечего — None."""
         details = {}
         containers = getattr(self.app, 'containers', None)
         if containers:  # копия: fit_details укорачивает хвосты на месте
             details['containers'] = [dict(c, log_tail=list(c['log_tail'])) for c in containers]
+        if self.channel:
+            details['channel'] = json.loads(json.dumps(self.channel))
         catalog = self.catalog()
         if catalog:
             details['emoji_catalog'] = catalog
@@ -372,29 +429,40 @@ class Reporter:
         """relay_file → details отчёта на relay_url, когда файл изменился. Никогда не бросает."""
         if not (self.enabled and self.relay_file):
             return False
+        mark = self.app.path('report-relay.json')
+        sent = read_json(mark, {})
+        sent = sent if isinstance(sent, dict) else {}
+        state = self.channel['relay'] = {'file': self.relay_file, 'opened': False}
+        state.update(file_meta(self.relay_file))
+        state['last'] = last_attempt(sent)
         try:
             body = read_untrusted_json(self.relay_file)
+            state['opened'] = True
             if not isinstance(body, dict):
                 raise ValueError('не объект JSON')
             if js_length(body) > DETAILS_LIMIT:
                 raise ValueError('длиннее %d знаков' % DETAILS_LIMIT)
         except (OSError, ValueError, RecursionError) as e:
+            state['error'] = short_error(e)
             log('пересылка: relay_file %s не прочитан (%s) — не шлю' % (self.relay_file, e))
             return False
         try:
-            mark = self.app.path('report-relay.json')
             # без generated_at в отпечатке: иначе каждый перезапуск контейнера ложился бы новой строкой в историю сайта (50 строк)
-            digest = meaning_digest(body)
-            if read_json(mark, {}).get('sha256') == digest:
+            digest = state['sha256'] = meaning_digest(body)
+            if sent.get('sha256') == digest:
                 return False
             report = {'event': 'heartbeat', 'ok': True, 'host': self.host, 'finished_at': utc_now(),
                       'message': 'итог из %s' % os.path.basename(self.relay_file), 'details': body}
             report.update({k: v for k, v in self.info().items() if v})
             code = self.send(report, self.relay_url)
+            now = time.time()
+            sent['last'] = {'code': code, 'at': now}
+            state['last'] = last_attempt(sent)
             if 200 <= code < 300:
-                write_json(mark, {'sha256': digest, 'at': time.time()})
+                write_json(mark, {'sha256': digest, 'at': now, 'last': sent['last']})
                 log('пересылка: %s → сайт принял' % os.path.basename(self.relay_file))
                 return True
+            write_json(mark, sent)  # отпечаток прежний: повтор при следующем запуске
             log('пересылка: сайт %s (%d)%s — повторю при следующем запуске' % (
                 'недоступен' if code == 0 else 'отверг', code, (' — ' + self.last_reply) if self.last_reply else ''))
             return False
@@ -406,33 +474,50 @@ class Reporter:
         """Файлы outbox_dir → PUT <url>/<вид>, когда смысл файла изменился. Сколько ушло; никогда не бросает."""
         if not (self.enabled and self.outbox_dir):
             return 0
+        mark = self.app.path('outbox-sent.json')
+        sent = read_json(mark, {})
+        sent = sent if isinstance(sent, dict) else {}
+        state = self.channel['outbox'] = {'dir': self.outbox_dir, 'opened': False}
         try:
-            files = read_outbox(self.outbox_dir)
-        except OSError as e:
-            log('outbox: папка %s не открыта (%s) — не шлю' % (self.outbox_dir, e))
-            return 0
-        try:
-            mark = self.app.path('outbox-sent.json')
-            sent = read_json(mark, {})
-            sent = sent if isinstance(sent, dict) else {}
+            try:
+                files = read_outbox(self.outbox_dir)
+            except OSError as e:
+                state['error'] = short_error(e)
+                log('outbox: папка %s не открыта (%s) — не шлю' % (self.outbox_dir, e))
+                return 0
+            state['opened'] = True
+            state['files'] = []
             done = 0
-            for kind, body in files:
-                if self._send_one(kind, body, sent):
+            for kind, body, meta in files:
+                problem = outbox_problem(body)
+                state['files'].append(dict({'kind': kind}, **meta, **({'error': short_error(problem)} if problem else {})))
+                if problem:
+                    log('outbox: %s.json не шлю (%s)' % (kind, problem))
+                elif self._send_one(kind, body, sent):
                     done += 1
             write_json(mark, sent)
             return done
         except Exception as e:  # ни при каких условиях не ломать обновление
             log('outbox: отправка не удалась: %r' % e)
             return 0
+        finally:
+            state['sent'] = self._sent_summary(sent)
+
+    @staticmethod
+    def _sent_summary(sent):
+        """{вид: {code, at}} последних отправок из outbox-sent.json — по имени, не больше OUTBOX_FILES."""
+        summary = {}
+        for kind in sorted(sent)[:OUTBOX_FILES]:
+            last = last_attempt(sent[kind]) if isinstance(sent[kind], dict) else None
+            if last:
+                summary[_name(kind)] = last
+        return summary
 
     def _send_one(self, kind, body, sent):
-        """Один файл outbox; итог — в sent[kind] ({sha256, at, code}), когда сайт ответил окончательно."""
-        problem = (str(body) if isinstance(body, Exception) else 'не объект JSON' if not isinstance(body, dict)
-                   else 'нет v: %d' % OUTBOX_VERSION if body.get('v') != OUTBOX_VERSION
-                   else 'длиннее %d знаков' % OUTBOX_LIMIT if js_length(body) > OUTBOX_LIMIT else '')
-        if problem:
-            log('outbox: %s.json не шлю (%s)' % (kind, problem))
-            return False
+        """Один проверенный файл outbox; итог — в sent[kind] ({sha256, at, code}), когда сайт ответил окончательно.
+
+        Любая попытка — ещё и в sent[kind]['last'] ({code, at}): её видно в channel, а отпечаток не трогается.
+        """
         digest = meaning_digest(body)
         last = sent.get(kind) if isinstance(sent.get(kind), dict) else {}
         if last.get('sha256') == digest:
@@ -440,6 +525,7 @@ class Reporter:
             if accepted or time.time() - float(last.get('at') or 0) < OUTBOX_RETRY_SEC:
                 return False
         code = self.send({'host': self.host, 'sent_at': utc_now(), 'body': body}, '%s/%s' % (self.url, kind))
+        sent[kind] = dict(last, last={'code': code, 'at': time.time()})
         reply = (' — ' + self.last_reply) if self.last_reply else ''
         if 200 <= code < 300:
             log('outbox: %s → сайт принял' % kind)
@@ -448,7 +534,7 @@ class Reporter:
             return False
         else:  # 4xx про сам файл (422 — вид сайт не принимает): тот же файл — не раньше чем через OUTBOX_RETRY_SEC
             log('outbox: %s — сайт отверг (%d)%s; тот же файл повторю через сутки' % (kind, code, reply))
-        sent[kind] = {'sha256': digest, 'at': time.time(), 'code': code}
+        sent[kind] = {'sha256': digest, 'at': time.time(), 'code': code, 'last': sent[kind]['last']}
         return 200 <= code < 300
 
     def after_run(self, code):
